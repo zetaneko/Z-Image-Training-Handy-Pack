@@ -2,7 +2,37 @@
 
 A collection of scripts, guides and information to help with fine-tuning or LoRA training with Z-Image (DiffSynth-Studio).
 
-## Python Scripts
+## Getting Started with Z-Image Training
+
+For official documentation on setting up and running Z-Image training, see the [DiffSynth-Studio Z-Image documentation](https://github.com/modelscope/DiffSynth-Studio/blob/main/docs/en/Model_Details/Z-Image.md).
+
+## Quick Start
+
+**Linux/macOS:**
+```bash
+./run.sh
+```
+
+**Windows:**
+```batch
+run.bat
+```
+
+These launcher scripts will:
+1. Create a Python virtual environment (if one doesn't exist)
+2. Install all required dependencies (Pillow, PyTorch, safetensors)
+3. Launch the GUI
+
+## GUI
+
+The GUI provides a tabbed interface with file browsers for each script and displays output in real-time.
+
+To run manually (if you have dependencies installed):
+```bash
+python python-scripts/gui.py
+```
+
+## Python Scripts (CLI)
 
 All scripts are in `python-scripts/` and use consistent CLI arguments. Run with `--help` for details.
 
