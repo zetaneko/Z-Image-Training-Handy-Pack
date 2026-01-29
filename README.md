@@ -1,6 +1,6 @@
 # Z-Image-Training-Handy-Pack
 
-A collection of scripts, guides and information to help with fine-tuning or LoRA training with Z-Image (DiffSynth-Studio).
+A collection of scripts, guides and information to help with fine-tuning or LoRA training with Z-Image (DiffSynth-Studio). I've also added a few scripts that will help adapt datasets already structured for most existing toolsets, and also with any prompts that were written Danbooru tag-style to do a quick-first pass conversion without LLM to preserve all intent.
 
 ## Getting Started with Z-Image Training
 
