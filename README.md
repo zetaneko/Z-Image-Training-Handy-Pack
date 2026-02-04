@@ -2,6 +2,28 @@
 
 A collection of scripts, guides and information to help with fine-tuning or LoRA training with Z-Image (DiffSynth-Studio). I've also added a few scripts that will help adapt datasets already structured for most existing toolsets, and also with any prompts that were written Danbooru tag-style to do a quick-first pass conversion without LLM to preserve all intent.
 
+## DiffSynth-Studio Attribution
+
+This repository includes a modified version of [DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio) by the ModelScope Community, specifically focusing on Z-Image training and inference capabilities.
+
+**Original Project:** https://github.com/modelscope/DiffSynth-Studio
+**License:** Apache License 2.0
+**Copyright:** ModelScope Community
+
+**What's Included:**
+- Z-Image model training and inference pipelines
+- Low-VRAM layer group training implementation for full fine-tuning
+- Core DiffSynth components (attention, data loading, model management, VRAM optimization)
+
+**Modifications:**
+- Streamlined to focus exclusively on Z-Image workflows
+- Added enhanced low-VRAM training via layer group splitting with CPU-offloaded optimizer
+- Integrated with dataset preparation utilities in this repository
+
+The original DiffSynth-Studio is a comprehensive diffusion model framework supporting multiple models (FLUX, Qwen-Image, Wan-Video, etc.). This repository contains only the Z-Image-specific components.
+
+For the full DiffSynth-Studio framework, visit the [official repository](https://github.com/modelscope/DiffSynth-Studio).
+
 ## Getting Started with Z-Image Training
 
 For official documentation on setting up and running Z-Image training, see the [DiffSynth-Studio Z-Image documentation](https://github.com/modelscope/DiffSynth-Studio/blob/main/docs/en/Model_Details/Z-Image.md).
