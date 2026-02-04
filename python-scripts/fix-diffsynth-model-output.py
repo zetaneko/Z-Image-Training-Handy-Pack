@@ -15,10 +15,16 @@ Example:
 """
 
 import argparse
+import sys
 from pathlib import Path
 
 import torch
 from safetensors.torch import load_file, save_file
+
+
+def print_status(message: str):
+    """Print status message with flush for GUI compatibility."""
+    print(message, flush=True)
 
 
 def convert_state_dict(ft_sd, original_sd):
@@ -87,19 +93,22 @@ Example:
     # Create output directory if needed
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading original model: {args.original}")
+    print_status(f"Loading original model: {args.original}")
     original_sd = load_file(str(args.original))
+    print_status(f"  Loaded {len(original_sd)} tensors from original model")
 
-    print(f"Loading fine-tuned checkpoint: {args.input}")
+    print_status(f"Loading fine-tuned checkpoint: {args.input}")
     ft_sd = load_file(str(args.input))
+    print_status(f"  Loaded {len(ft_sd)} tensors from fine-tuned checkpoint")
 
-    print("Converting state dict...")
+    print_status("Converting state dict...")
     converted_sd = convert_state_dict(ft_sd, original_sd)
+    print_status(f"  Merged to {len(converted_sd)} tensors")
 
-    print(f"Saving converted checkpoint: {args.output}")
+    print_status(f"Saving converted checkpoint: {args.output}")
     save_file(converted_sd, str(args.output))
 
-    print("Converted checkpoint saved. Load this in ComfyUI.")
+    print_status("Converted checkpoint saved. Load this in ComfyUI.")
     return 0
 
 

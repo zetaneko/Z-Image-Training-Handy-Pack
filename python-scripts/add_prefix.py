@@ -24,7 +24,23 @@ TEXT_EXTENSIONS = {'.txt'}
 ALL_EXTENSIONS = IMAGE_EXTENSIONS | TEXT_EXTENSIONS
 
 
-def add_prefix_to_folder(folder: Path, prefix: str, dry_run: bool = False) -> int:
+def print_progress(current: int, total: int, prefix: str = "Processing"):
+    """Print progress that works in both terminal and GUI modes."""
+    if total == 0:
+        return
+    percent = (current / total) * 100
+    message = f"{prefix}: {current}/{total} ({percent:.0f}%)"
+
+    if sys.stdout.isatty():
+        # Terminal: use carriage return for in-place update
+        print(f"\r{message}", end="", flush=True)
+    else:
+        # GUI/pipe: print full lines (less frequent to avoid spam)
+        if current == 1 or current == total or current % max(1, total // 20) == 0:
+            print(message, flush=True)
+
+
+def add_prefix_to_folder(folder: Path, prefix: str, dry_run: bool = False, show_progress: bool = False) -> int:
     """Add prefix to all image and txt files in folder. Returns count of renamed files."""
     renamed = 0
 
@@ -37,16 +53,24 @@ def add_prefix_to_folder(folder: Path, prefix: str, dry_run: bool = False) -> in
                 continue
             files_to_rename.append(file_path)
 
+    total = len(files_to_rename)
+
     # Rename files
-    for file_path in files_to_rename:
+    for i, file_path in enumerate(files_to_rename, 1):
         new_name = prefix + file_path.name
         new_path = file_path.parent / new_name
 
         if dry_run:
             print(f"  {file_path.name} -> {new_name}")
         else:
+            if show_progress:
+                print_progress(i, total, "Renaming")
             file_path.rename(new_path)
         renamed += 1
+
+    # Clear progress line in terminal mode
+    if show_progress and not dry_run and sys.stdout.isatty() and total > 0:
+        print()
 
     return renamed
 
@@ -96,8 +120,8 @@ def interactive_mode(script_dir: Path):
         return 0
 
     # Do the actual rename
-    renamed = add_prefix_to_folder(folder_path, prefix, dry_run=False)
-    print(f"\nDone! Renamed {renamed} files.")
+    renamed = add_prefix_to_folder(folder_path, prefix, dry_run=False, show_progress=True)
+    print(f"Done! Renamed {renamed} files.")
     return 0
 
 
@@ -163,8 +187,8 @@ Example:
             return 0
 
     # Do the actual rename
-    renamed = add_prefix_to_folder(args.input, args.prefix, dry_run=False)
-    print(f"\nDone! Renamed {renamed} files.")
+    renamed = add_prefix_to_folder(args.input, args.prefix, dry_run=False, show_progress=True)
+    print(f"Done! Renamed {renamed} files.")
     return 0
 
 

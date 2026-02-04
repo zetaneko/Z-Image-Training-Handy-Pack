@@ -24,6 +24,22 @@ from pathlib import Path
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tiff'}
 
 
+def print_progress(current: int, total: int, prefix: str = "Processing"):
+    """Print progress that works in both terminal and GUI modes."""
+    if total == 0:
+        return
+    percent = (current / total) * 100
+    message = f"{prefix}: {current}/{total} ({percent:.0f}%)"
+
+    if sys.stdout.isatty():
+        # Terminal: use carriage return for in-place update
+        print(f"\r{message}", end="", flush=True)
+    else:
+        # GUI/pipe: print full lines (less frequent to avoid spam)
+        if current == 1 or current == total or current % max(1, total // 20) == 0:
+            print(message, flush=True)
+
+
 def load_existing_metadata(csv_path: Path) -> set[str]:
     """Load existing image filenames from metadata.csv if it exists."""
     existing = set()
@@ -35,20 +51,33 @@ def load_existing_metadata(csv_path: Path) -> set[str]:
     return existing
 
 
-def find_image_prompt_pairs(folder: Path) -> list[tuple[str, str]]:
+def find_image_prompt_pairs(folder: Path, show_progress: bool = False) -> list[tuple[str, str]]:
     """Find all image files and their corresponding .txt prompts in a folder."""
     pairs = []
 
-    for file_path in folder.iterdir():
-        if file_path.suffix.lower() in IMAGE_EXTENSIONS:
-            # Look for corresponding .txt file
-            txt_path = file_path.with_suffix('.txt')
-            if txt_path.exists():
-                with open(txt_path, 'r', encoding='utf-8') as f:
-                    prompt = f.read().strip()
-                    # Replace newlines with spaces for CSV compatibility
-                    prompt = prompt.replace('\n', ' ').replace('\r', ' ')
-                pairs.append((file_path.name, prompt))
+    # Collect image files first to get total count
+    image_files = [
+        f for f in folder.iterdir()
+        if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
+    ]
+    total = len(image_files)
+
+    for i, file_path in enumerate(image_files, 1):
+        if show_progress:
+            print_progress(i, total, f"Scanning {folder.name}")
+
+        # Look for corresponding .txt file
+        txt_path = file_path.with_suffix('.txt')
+        if txt_path.exists():
+            with open(txt_path, 'r', encoding='utf-8') as f:
+                prompt = f.read().strip()
+                # Replace newlines with spaces for CSV compatibility
+                prompt = prompt.replace('\n', ' ').replace('\r', ' ')
+            pairs.append((file_path.name, prompt))
+
+    # Clear progress line in terminal mode
+    if show_progress and sys.stdout.isatty() and total > 0:
+        print()
 
     return pairs
 
@@ -98,7 +127,7 @@ Example:
         if not item.is_dir() or item.name == 'original' or item.name.startswith('.'):
             continue
 
-        folder_pairs = find_image_prompt_pairs(item)
+        folder_pairs = find_image_prompt_pairs(item, show_progress=True)
 
         # Filter out already existing entries
         for image_name, prompt in folder_pairs:

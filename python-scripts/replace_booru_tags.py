@@ -24,6 +24,22 @@ import sys
 from pathlib import Path
 
 
+def print_progress(current: int, total: int, prefix: str = "Processing"):
+    """Print progress that works in both terminal and GUI modes."""
+    if total == 0:
+        return
+    percent = (current / total) * 100
+    message = f"{prefix}: {current}/{total} ({percent:.0f}%)"
+
+    if sys.stdout.isatty():
+        # Terminal: use carriage return for in-place update
+        print(f"\r{message}", end="", flush=True)
+    else:
+        # GUI/pipe: print full lines (less frequent to avoid spam)
+        if current == 1 or current == total or current % max(1, total // 20) == 0:
+            print(message, flush=True)
+
+
 def load_tag_conversions(csv_path: Path) -> dict[str, str]:
     """Load tag to caption mappings from CSV file."""
     conversions = {}
@@ -608,7 +624,7 @@ def process_txt_file(txt_path: Path, conversions: dict[str, str]) -> str:
     return processor.process()
 
 
-def backup_and_replace(folder: Path, conversions: dict[str, str]) -> tuple[int, int]:
+def backup_and_replace(folder: Path, conversions: dict[str, str], show_progress: bool = False) -> tuple[int, int]:
     """Process all .txt files in a folder."""
     original_folder = folder / 'original'
     processed = 0
@@ -619,8 +635,12 @@ def backup_and_replace(folder: Path, conversions: dict[str, str]) -> tuple[int, 
         return 0, 0
 
     original_folder.mkdir(exist_ok=True)
+    total = len(txt_files)
 
-    for txt_path in txt_files:
+    for i, txt_path in enumerate(txt_files, 1):
+        if show_progress:
+            print_progress(i, total, f"Converting tags in {folder.name}")
+
         backup_path = original_folder / txt_path.name
 
         if backup_path.exists():
@@ -632,6 +652,10 @@ def backup_and_replace(folder: Path, conversions: dict[str, str]) -> tuple[int, 
         with open(txt_path, 'w', encoding='utf-8') as f:
             f.write(new_content)
         processed += 1
+
+    # Clear progress line in terminal mode
+    if show_progress and sys.stdout.isatty() and total > 0:
+        print()
 
     return processed, skipped
 
@@ -682,7 +706,7 @@ Example:
     total_skipped = 0
 
     for folder in folders_to_process:
-        processed, skipped = backup_and_replace(folder, conversions)
+        processed, skipped = backup_and_replace(folder, conversions, show_progress=True)
         if processed > 0 or skipped > 0:
             print(f"{folder.name}: {processed} processed, {skipped} skipped")
             total_processed += processed
