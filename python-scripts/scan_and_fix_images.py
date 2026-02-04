@@ -13,9 +13,27 @@ Example:
 
 import argparse
 import shutil
+import sys
 from pathlib import Path
 
 from PIL import Image, ImageFile
+
+
+def print_progress(current: int, total: int, prefix: str = "Processing"):
+    """Print progress that works in both terminal and GUI modes."""
+    if total == 0:
+        return
+    percent = (current / total) * 100
+    message = f"{prefix}: {current}/{total} ({percent:.0f}%)"
+
+    if sys.stdout.isatty():
+        # Terminal: use carriage return for in-place update
+        print(f"\r{message}", end="", flush=True)
+    else:
+        # GUI/pipe: print full lines (less frequent to avoid spam)
+        # Update every 5% or on first/last item
+        if current == 1 or current == total or current % max(1, total // 20) == 0:
+            print(message, flush=True)
 
 # Enable best-effort load for slightly truncated images
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -53,11 +71,21 @@ def process_images(input_dir: Path, output_dir: Path, quarantine_dir: Path, min_
     resized = 0
     copied = 0
 
-    for p in input_dir.rglob("*"):
-        if not p.is_file():
-            continue
-        if p.suffix.lower() not in IMAGE_EXTENSIONS:
-            continue
+    # First, collect all image files to get total count
+    image_files = [
+        p for p in input_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+    ]
+    total = len(image_files)
+
+    if total == 0:
+        print("No image files found.")
+        return
+
+    print(f"Found {total} images to process...")
+
+    for i, p in enumerate(image_files, 1):
+        print_progress(i, total, "Processing")
 
         checked += 1
         rel = p.relative_to(input_dir)
@@ -94,6 +122,10 @@ def process_images(input_dir: Path, output_dir: Path, quarantine_dir: Path, min_
             cap_dst = out.with_suffix(".txt")
             shutil.copy2(str(cap_src), str(cap_dst))
             copied += 1
+
+    # Clear progress line in terminal mode
+    if sys.stdout.isatty():
+        print()
 
     # Print summary
     print(f"Checked images : {checked}")
