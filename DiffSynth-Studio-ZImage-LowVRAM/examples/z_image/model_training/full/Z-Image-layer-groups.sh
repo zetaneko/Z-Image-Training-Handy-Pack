@@ -46,6 +46,17 @@ echo "=============================================="
 # Configuration - adjust these for your setup
 # ==========================================
 
+# Model storage location (optional)
+# By default, models are downloaded to ./models in the project directory.
+# Uncomment and set MODEL_BASE_PATH to use a custom location:
+# - Useful for storing models on a different drive
+# - Allows sharing models between projects
+# - Can point to existing Hugging Face cache (e.g., ~/.cache/huggingface/hub)
+# Examples:
+#   MODEL_BASE_PATH="/data/ai-models"
+#   MODEL_BASE_PATH="$HOME/.cache/huggingface/hub"
+#   MODEL_BASE_PATH="/mnt/storage/models"
+
 # Dataset settings
 DATASET_PATH="/path"
 DATASET_METADATA="${DATASET_PATH}/metadata.csv"
@@ -53,7 +64,8 @@ DATASET_REPEAT=25
 MAX_PIXELS=1048576
 
 # Model settings
-MODEL_PATHS="Tongyi-MAI/Z-Image:transformer/*.safetensors,Tongyi-MAI/Z-Image-Turbo:text_encoder/*.safetensors,Tongyi-MAI/Z-Image-Turbo:vae/diffusion_pytorch_model.safetensors"
+MODEL_PATHS="Tongyi-MAI/Z-Image:transformer/*.safetensors,Tongyi-MAI/Z-Image:text_encoder/*.safetensors,Tongyi-MAI/Z-Image:vae/diffusion_pytorch_model.safetensors"
+# MODEL_BASE_PATH=""  # Uncomment and set to override default ./models location (e.g., "/data/models" or "$HOME/.cache/huggingface")
 
 # Layer group settings (tune based on VRAM)
 NUM_LAYER_GROUPS=6          # More groups = less VRAM, more swaps
@@ -105,6 +117,7 @@ python examples/z_image/model_training/train_layer_groups.py \
   --dataset_repeat $DATASET_REPEAT \
   --max_pixels $MAX_PIXELS \
   --model_id_with_origin_paths "$MODEL_PATHS" \
+  $([ -n "$MODEL_BASE_PATH" ] && echo "--model_base_path \"$MODEL_BASE_PATH\"") \
   --trainable_models "dit" \
   --num_layer_groups $NUM_LAYER_GROUPS \
   --images_per_group_batch $IMAGES_PER_GROUP_BATCH \

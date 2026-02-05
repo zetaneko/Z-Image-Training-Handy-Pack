@@ -25,6 +25,11 @@ source "$PROJECT_ROOT/venv/bin/activate"
 # Change to project root so relative paths work
 cd "$PROJECT_ROOT"
 
+# To use a custom model storage location, add:
+#   --model_base_path "/path/to/your/models"
+# or set the environment variable before running:
+#   export DIFFSYNTH_MODEL_BASE_PATH="/path/to/your/models"
+
 accelerate launch \
   --config_file examples/z_image/model_training/full/accelerate_config_single_gpu.yaml \
   examples/z_image/model_training/train.py \

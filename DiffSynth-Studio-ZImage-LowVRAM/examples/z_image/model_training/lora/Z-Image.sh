@@ -1,3 +1,8 @@
+# To use a custom model storage location, add:
+#   --model_base_path "/path/to/your/models"
+# or set the environment variable:
+#   export DIFFSYNTH_MODEL_BASE_PATH="/path/to/your/models"
+
 accelerate launch examples/z_image/model_training/train.py \
   --dataset_base_path data/example_image_dataset \
   --dataset_metadata_path data/example_image_dataset/metadata.csv \

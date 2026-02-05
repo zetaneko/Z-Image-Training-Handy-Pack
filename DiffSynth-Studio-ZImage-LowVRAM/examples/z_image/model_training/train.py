@@ -100,6 +100,12 @@ def z_image_parser():
 if __name__ == "__main__":
     parser = z_image_parser()
     args = parser.parse_args()
+
+    # Set custom model base path if provided
+    if args.model_base_path is not None:
+        os.environ['DIFFSYNTH_MODEL_BASE_PATH'] = args.model_base_path
+        print(f"Using custom model base path: {args.model_base_path}")
+
     accelerator = accelerate.Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],

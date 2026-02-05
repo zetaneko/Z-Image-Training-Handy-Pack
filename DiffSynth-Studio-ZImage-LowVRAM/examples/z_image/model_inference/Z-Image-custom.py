@@ -6,6 +6,13 @@ import os
 # Path to your custom trained transformer model (.safetensors)
 CUSTOM_MODEL_PATH = "/media/misty/M2 Drive/models/diffusion_models/step-5000.safetensors"
 
+# Optional: Set custom model base path for downloaded models
+# Uncomment and set to override default ./models location:
+# os.environ['DIFFSYNTH_MODEL_BASE_PATH'] = "/path/to/your/models"
+# Examples:
+#   os.environ['DIFFSYNTH_MODEL_BASE_PATH'] = "/data/ai-models"
+#   os.environ['DIFFSYNTH_MODEL_BASE_PATH'] = os.path.expanduser("~/.cache/huggingface/hub")
+
 # Get the directory where this script is located
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
