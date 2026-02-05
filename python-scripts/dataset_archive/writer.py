@@ -46,8 +46,8 @@ class DatasetArchiveWriter:
         self.total_chunks = total_chunks
         self.compute_checksums = compute_checksums
 
-        # Pending entries: list of (image_bytes, caption_str, filename, width, height, format)
-        self._entries: list[tuple[bytes, str, str, int, int, ImageFormat]] = []
+        # Pending entries: list of (image_bytes, caption_str, filename, width, height, format, precomputed_crc)
+        self._entries: list[tuple[bytes, str, str, int, int, ImageFormat, Optional[int]]] = []
         self._finalized = False
 
     def add_entry(
@@ -96,6 +96,7 @@ class DatasetArchiveWriter:
             width,
             height,
             img_format,
+            None,  # No precomputed CRC
         ))
 
     def add_entry_bytes(
@@ -106,6 +107,7 @@ class DatasetArchiveWriter:
         width: int = 0,
         height: int = 0,
         image_format: Optional[ImageFormat] = None,
+        precomputed_crc32: Optional[int] = None,
     ) -> None:
         """
         Add an image+caption entry from bytes.
@@ -117,6 +119,7 @@ class DatasetArchiveWriter:
             width: Image width (0 if unknown)
             height: Image height (0 if unknown)
             image_format: Image format enum (auto-detected from filename if None)
+            precomputed_crc32: Pre-computed CRC32 (avoids recomputation when copying)
         """
         if self._finalized:
             raise RuntimeError("Cannot add entries after finalize()")
@@ -138,6 +141,7 @@ class DatasetArchiveWriter:
             width,
             height,
             image_format,
+            precomputed_crc32,
         ))
 
     def _get_image_dimensions(self, image_bytes: bytes) -> tuple[int, int]:
@@ -173,7 +177,7 @@ class DatasetArchiveWriter:
         string_table = BytesIO()
         string_offsets: list[tuple[int, int]] = []  # (offset, length) for each entry
 
-        for _, _, filename, _, _, _ in self._entries:
+        for _, _, filename, _, _, _, _ in self._entries:
             encoded = filename.encode('utf-8')
             offset = string_table.tell()
             string_table.write(encoded)
@@ -195,7 +199,7 @@ class DatasetArchiveWriter:
         data_buffer = BytesIO()
         index_entries: list[IndexEntry] = []
 
-        for i, (image_bytes, caption, filename, width, height, img_format) in enumerate(self._entries):
+        for i, (image_bytes, caption, filename, width, height, img_format, precomputed_crc) in enumerate(self._entries):
             caption_bytes = caption.encode('utf-8')
 
             # Current position in data buffer (relative to data section start)
@@ -218,10 +222,13 @@ class DatasetArchiveWriter:
             padding = align_offset(data_buffer.tell()) - data_buffer.tell()
             data_buffer.write(b'\x00' * padding)
 
-            # Compute checksum
+            # Use precomputed checksum if available, otherwise compute
             crc32 = 0
             if self.compute_checksums:
-                crc32 = zlib.crc32(image_bytes) & 0xFFFFFFFF
+                if precomputed_crc is not None:
+                    crc32 = precomputed_crc
+                else:
+                    crc32 = zlib.crc32(image_bytes) & 0xFFFFFFFF
 
             # Get string table reference
             str_offset, str_length = string_offsets[i]
@@ -292,11 +299,11 @@ class DatasetArchiveWriter:
         size = HEADER_SIZE + len(self._entries) * INDEX_ENTRY_SIZE
 
         # String table
-        for _, _, filename, _, _, _ in self._entries:
+        for _, _, filename, _, _, _, _ in self._entries:
             size += len(filename.encode('utf-8'))
 
         # Data (with alignment overhead estimate)
-        for image_bytes, caption, _, _, _, _ in self._entries:
+        for image_bytes, caption, _, _, _, _, _ in self._entries:
             size += len(image_bytes)
             size += len(caption.encode('utf-8'))
             size += DATA_ALIGNMENT * 2  # Alignment overhead per entry
@@ -307,3 +314,42 @@ class DatasetArchiveWriter:
     def entry_count(self) -> int:
         """Number of entries added so far."""
         return len(self._entries)
+
+    def copy_entry_from_archive(self, archive: 'DatasetArchive', index: int) -> None:
+        """
+        Copy an entry from an existing archive without re-processing.
+
+        This is efficient because it:
+        - Reads raw image bytes directly (no decode/encode)
+        - Preserves the existing CRC32 checksum
+        - Preserves dimensions and format metadata
+
+        Args:
+            archive: Source DatasetArchive to copy from
+            index: Index of entry to copy
+        """
+        if self._finalized:
+            raise RuntimeError("Cannot add entries after finalize()")
+
+        # Get entry info (metadata only, no data read yet)
+        info = archive.get_entry_info(index)
+
+        # Read raw image bytes and caption
+        image_bytes = archive.get_image(index)
+        caption = archive.get_caption(index)
+
+        self._entries.append((
+            image_bytes,
+            caption,
+            info.filename,
+            info.width,
+            info.height,
+            info.image_format,
+            info.crc32 if info.crc32 != 0 else None,  # Preserve existing CRC
+        ))
+
+
+# Import at module level for type hints (avoid circular import)
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .reader import DatasetArchive
