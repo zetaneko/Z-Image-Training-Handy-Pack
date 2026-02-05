@@ -566,6 +566,319 @@ class FixDiffSynthTab(ttk.Frame):
         self.runner.run(cmd)
 
 
+class AutoCaptionTab(ttk.Frame):
+    """Tab for auto_caption.py script - LM Studio vision captioning."""
+
+    def __init__(self, parent, script_dir: Path, output_widget: scrolledtext.ScrolledText, settings_manager: SettingsManager):
+        super().__init__(parent, padding=10)
+        self.script_path = script_dir / 'auto_caption.py'
+        self.output_widget = output_widget
+        self.settings_manager = settings_manager
+        self.tab_name = 'auto_caption'
+
+        # Default prompts
+        self.default_prompt = "Write a descriptive caption for this image in a formal tone. Focus on the main subjects, their appearance, actions, setting, and mood. Be detailed but concise."
+        self.default_prompt_with_tags = """Write a descriptive caption for this image in a formal tone. These are the tags previously made for this image to extend on:
+
+{existing_caption}
+
+Use these tags as a starting point to write a natural, flowing description. Focus on the main subjects, their appearance, actions, setting, and mood. Be detailed but concise."""
+
+        # Create canvas with scrollbar for scrollable content
+        canvas = tk.Canvas(self, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        # Description
+        desc = ttk.Label(scrollable_frame, text="Auto-caption images using LM Studio's vision model API.\n"
+                                    "Reads existing .txt captions and writes new captions to .autocaption.txt files.",
+                        wraplength=600, justify='left')
+        desc.pack(anchor='w', pady=(0, 15))
+
+        # Input folder
+        input_frame = ttk.LabelFrame(scrollable_frame, text="Input Settings", padding=10)
+        input_frame.pack(fill='x', pady=5)
+
+        self.input_path = PathSelector(input_frame, "Input Folder:", mode='folder')
+        self.input_path.pack(fill='x', pady=3)
+        ttk.Label(input_frame, text="(Will traverse all subdirectories)", font=('TkDefaultFont', 8)).pack(anchor='e')
+
+        options_frame = ttk.Frame(input_frame)
+        options_frame.pack(fill='x', pady=5)
+        self.recursive_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(options_frame, text="Traverse subdirectories", variable=self.recursive_var).pack(side='left')
+        self.overwrite_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(options_frame, text="Overwrite existing .autocaption.txt", variable=self.overwrite_var).pack(side='left', padx=(20, 0))
+
+        # API Settings
+        api_frame = ttk.LabelFrame(scrollable_frame, text="LM Studio API Settings", padding=10)
+        api_frame.pack(fill='x', pady=5)
+
+        url_frame = ttk.Frame(api_frame)
+        url_frame.pack(fill='x', pady=3)
+        ttk.Label(url_frame, text="API URL:", width=15, anchor='e').pack(side='left', padx=(0, 5))
+        self.api_url_var = tk.StringVar(value="http://localhost:1234/v1")
+        ttk.Entry(url_frame, textvariable=self.api_url_var, width=40).pack(side='left', fill='x', expand=True)
+
+        model_frame = ttk.Frame(api_frame)
+        model_frame.pack(fill='x', pady=3)
+        ttk.Label(model_frame, text="Model:", width=15, anchor='e').pack(side='left', padx=(0, 5))
+        self.model_var = tk.StringVar(value="")
+        ttk.Entry(model_frame, textvariable=self.model_var, width=40).pack(side='left', fill='x', expand=True)
+        ttk.Label(model_frame, text="(Leave empty for loaded model)", font=('TkDefaultFont', 8)).pack(side='left', padx=(5, 0))
+
+        # Caption Settings
+        caption_frame = ttk.LabelFrame(scrollable_frame, text="Caption Settings", padding=10)
+        caption_frame.pack(fill='x', pady=5)
+
+        self.use_existing_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(caption_frame, text="Include existing .txt caption in prompt (for extending tags)",
+                       variable=self.use_existing_var, command=self._update_prompt_preview).pack(anchor='w', pady=3)
+
+        # System prompt
+        prompt_label_frame = ttk.Frame(caption_frame)
+        prompt_label_frame.pack(fill='x', pady=(10, 3))
+        ttk.Label(prompt_label_frame, text="System Prompt:").pack(side='left')
+        ttk.Button(prompt_label_frame, text="Reset to Default", command=self._reset_prompt, width=15).pack(side='right')
+
+        self.system_prompt_text = tk.Text(caption_frame, height=6, width=60, wrap='word')
+        self.system_prompt_text.insert('1.0', self.default_prompt)
+        self.system_prompt_text.pack(fill='x', pady=3)
+
+        ttk.Label(caption_frame, text="Use {existing_caption} placeholder where existing tags should be inserted",
+                 font=('TkDefaultFont', 8), foreground='gray').pack(anchor='w')
+
+        # User prompt
+        user_frame = ttk.Frame(caption_frame)
+        user_frame.pack(fill='x', pady=(10, 3))
+        ttk.Label(user_frame, text="User Prompt:", width=15, anchor='e').pack(side='left', padx=(0, 5))
+        self.user_prompt_var = tk.StringVar(value="Please caption this image.")
+        ttk.Entry(user_frame, textvariable=self.user_prompt_var, width=50).pack(side='left', fill='x', expand=True)
+
+        # Generation Settings
+        gen_frame = ttk.LabelFrame(scrollable_frame, text="Generation Settings", padding=10)
+        gen_frame.pack(fill='x', pady=5)
+
+        tokens_frame = ttk.Frame(gen_frame)
+        tokens_frame.pack(fill='x', pady=3)
+        ttk.Label(tokens_frame, text="Max Tokens:", width=15, anchor='e').pack(side='left', padx=(0, 5))
+        self.max_tokens_var = tk.IntVar(value=500)
+        ttk.Spinbox(tokens_frame, from_=50, to=2000, increment=50, textvariable=self.max_tokens_var, width=10).pack(side='left')
+
+        temp_frame = ttk.Frame(gen_frame)
+        temp_frame.pack(fill='x', pady=3)
+        ttk.Label(temp_frame, text="Temperature:", width=15, anchor='e').pack(side='left', padx=(0, 5))
+        self.temperature_var = tk.DoubleVar(value=0.7)
+        ttk.Spinbox(temp_frame, from_=0.0, to=2.0, increment=0.1, textvariable=self.temperature_var, width=10).pack(side='left')
+        ttk.Label(temp_frame, text="(0.0 = deterministic, higher = more creative)", font=('TkDefaultFont', 8)).pack(side='left', padx=(10, 0))
+
+        delay_frame = ttk.Frame(gen_frame)
+        delay_frame.pack(fill='x', pady=3)
+        ttk.Label(delay_frame, text="Delay (seconds):", width=15, anchor='e').pack(side='left', padx=(0, 5))
+        self.delay_var = tk.DoubleVar(value=0.0)
+        ttk.Spinbox(delay_frame, from_=0.0, to=10.0, increment=0.5, textvariable=self.delay_var, width=10).pack(side='left')
+        ttk.Label(delay_frame, text="(Between API calls, to avoid rate limits)", font=('TkDefaultFont', 8)).pack(side='left', padx=(10, 0))
+
+        # Buttons frame
+        btn_frame = ttk.Frame(scrollable_frame)
+        btn_frame.pack(pady=15)
+
+        self.test_btn = ttk.Button(btn_frame, text="Test Connection", command=self._test_connection, width=15)
+        self.test_btn.pack(side='left', padx=5)
+
+        self.dry_run_btn = ttk.Button(btn_frame, text="Dry Run", command=self._dry_run, width=12)
+        self.dry_run_btn.pack(side='left', padx=5)
+
+        self.run_btn = ttk.Button(btn_frame, text="Start Captioning", command=self._run, width=15)
+        self.run_btn.pack(side='left', padx=5)
+
+        self.stop_btn = ttk.Button(btn_frame, text="Stop", command=self._stop, state='disabled', width=10)
+        self.stop_btn.pack(side='left', padx=5)
+
+        # Pack canvas and scrollbar
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # Bind mouse wheel
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+        canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+
+        self.runner = ScriptRunner(output_widget, self.run_btn, self.stop_btn)
+
+        # Load saved settings
+        self.load_settings()
+
+    def _update_prompt_preview(self):
+        """Update the system prompt when use_existing changes."""
+        current_prompt = self.system_prompt_text.get('1.0', 'end').strip()
+
+        # If current prompt is the default (without tags), switch to with-tags version
+        if self.use_existing_var.get():
+            if current_prompt == self.default_prompt:
+                self.system_prompt_text.delete('1.0', 'end')
+                self.system_prompt_text.insert('1.0', self.default_prompt_with_tags)
+        else:
+            if current_prompt == self.default_prompt_with_tags:
+                self.system_prompt_text.delete('1.0', 'end')
+                self.system_prompt_text.insert('1.0', self.default_prompt)
+
+    def _reset_prompt(self):
+        """Reset system prompt to default."""
+        self.system_prompt_text.delete('1.0', 'end')
+        if self.use_existing_var.get():
+            self.system_prompt_text.insert('1.0', self.default_prompt_with_tags)
+        else:
+            self.system_prompt_text.insert('1.0', self.default_prompt)
+
+    def _test_connection(self):
+        """Test API connection."""
+        import urllib.request
+        self.runner.clear_output()
+        self.runner.append_output(f"Testing connection to {self.api_url_var.get()}...\n")
+
+        try:
+            url = f"{self.api_url_var.get().rstrip('/')}/models"
+            req = urllib.request.Request(url, method='GET')
+            with urllib.request.urlopen(req, timeout=5) as response:
+                if response.status == 200:
+                    self.runner.append_output("✓ Connection successful!\n")
+                    # Try to get model info
+                    import json
+                    data = json.loads(response.read().decode('utf-8'))
+                    if 'data' in data and len(data['data']) > 0:
+                        self.runner.append_output(f"\nLoaded models:\n")
+                        for model in data['data']:
+                            self.runner.append_output(f"  - {model.get('id', 'unknown')}\n")
+                else:
+                    self.runner.append_output(f"✗ Unexpected status: {response.status}\n")
+        except Exception as e:
+            self.runner.append_output(f"✗ Connection failed: {e}\n")
+            self.runner.append_output("\nMake sure LM Studio is running with:\n")
+            self.runner.append_output("  1. A vision model loaded (e.g., llava, moondream)\n")
+            self.runner.append_output("  2. Local server enabled (Developer -> Local Server -> Start)\n")
+
+    def _stop(self):
+        """Stop the running script."""
+        self.runner.stop()
+
+    def _build_cmd(self, dry_run: bool = False) -> list[str]:
+        """Build the command to run."""
+        input_path = self.input_path.get()
+        if not input_path:
+            return None
+
+        cmd = [sys.executable, str(self.script_path), '--input', input_path]
+
+        # API settings
+        cmd.extend(['--api-url', self.api_url_var.get()])
+        if self.model_var.get():
+            cmd.extend(['--model', self.model_var.get()])
+
+        # Caption settings
+        if self.use_existing_var.get():
+            cmd.append('--use-existing-caption')
+
+        system_prompt = self.system_prompt_text.get('1.0', 'end').strip()
+        if system_prompt:
+            cmd.extend(['--system-prompt', system_prompt])
+
+        user_prompt = self.user_prompt_var.get()
+        if user_prompt:
+            cmd.extend(['--user-prompt', user_prompt])
+
+        # Generation settings
+        cmd.extend(['--max-tokens', str(self.max_tokens_var.get())])
+        cmd.extend(['--temperature', str(self.temperature_var.get())])
+        cmd.extend(['--delay', str(self.delay_var.get())])
+
+        # Processing options
+        if not self.recursive_var.get():
+            cmd.append('--no-recursive')
+        if self.overwrite_var.get():
+            cmd.append('--overwrite')
+        if dry_run:
+            cmd.append('--dry-run')
+
+        return cmd
+
+    def _dry_run(self):
+        """Run in dry-run mode."""
+        if not self.input_path.get():
+            self.runner.clear_output()
+            self.runner.append_output("Error: Please select an input folder\n")
+            return
+
+        cmd = self._build_cmd(dry_run=True)
+        self.save_settings()
+        self.runner.run(cmd)
+
+    def _run(self):
+        """Run the captioning."""
+        if not self.input_path.get():
+            self.runner.clear_output()
+            self.runner.append_output("Error: Please select an input folder\n")
+            return
+
+        cmd = self._build_cmd(dry_run=False)
+        self.save_settings()
+        self.runner.run(cmd)
+
+    def get_settings(self) -> Dict[str, Any]:
+        """Get current tab settings."""
+        return {
+            'input_path': self.input_path.get(),
+            'api_url': self.api_url_var.get(),
+            'model': self.model_var.get(),
+            'use_existing': self.use_existing_var.get(),
+            'system_prompt': self.system_prompt_text.get('1.0', 'end').strip(),
+            'user_prompt': self.user_prompt_var.get(),
+            'max_tokens': self.max_tokens_var.get(),
+            'temperature': self.temperature_var.get(),
+            'delay': self.delay_var.get(),
+            'recursive': self.recursive_var.get(),
+            'overwrite': self.overwrite_var.get()
+        }
+
+    def set_settings(self, settings: Dict[str, Any]):
+        """Set tab settings."""
+        self.input_path.set(settings.get('input_path', ''))
+        self.api_url_var.set(settings.get('api_url', 'http://localhost:1234/v1'))
+        self.model_var.set(settings.get('model', ''))
+        self.use_existing_var.set(settings.get('use_existing', False))
+
+        system_prompt = settings.get('system_prompt', self.default_prompt)
+        self.system_prompt_text.delete('1.0', 'end')
+        self.system_prompt_text.insert('1.0', system_prompt)
+
+        self.user_prompt_var.set(settings.get('user_prompt', 'Please caption this image.'))
+        self.max_tokens_var.set(settings.get('max_tokens', 500))
+        self.temperature_var.set(settings.get('temperature', 0.7))
+        self.delay_var.set(settings.get('delay', 0.0))
+        self.recursive_var.set(settings.get('recursive', True))
+        self.overwrite_var.set(settings.get('overwrite', False))
+
+    def save_settings(self):
+        """Save current settings."""
+        self.settings_manager.set_tab_settings(self.tab_name, self.get_settings())
+
+    def load_settings(self):
+        """Load saved settings."""
+        settings = self.settings_manager.get_tab_settings(self.tab_name)
+        if settings:
+            self.set_settings(settings)
+
+
 class LayerGroupTrainingTab(ttk.Frame):
     """Tab for low-VRAM layer group training."""
 
@@ -900,6 +1213,8 @@ class App(tk.Tk):
                          text="Replace Booru Tags")
         self.notebook.add(GenerateMetadataTab(self.notebook, self.script_dir, self.output_text, self.settings_manager),
                          text="Generate Metadata")
+        self.notebook.add(AutoCaptionTab(self.notebook, self.script_dir, self.output_text, self.settings_manager),
+                         text="Auto Caption")
         self.notebook.add(FixDiffSynthTab(self.notebook, self.script_dir, self.output_text, self.settings_manager),
                          text="Fix DiffSynth Output")
         self.notebook.add(LayerGroupTrainingTab(self.notebook, self.project_root, self.output_text, self.settings_manager),
