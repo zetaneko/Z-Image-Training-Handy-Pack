@@ -3,6 +3,7 @@ from typing import Optional, Union
 from dataclasses import dataclass
 from modelscope import snapshot_download
 from huggingface_hub import snapshot_download as hf_snapshot_download
+from pathlib import Path
 from typing import Optional
 
 
@@ -23,7 +24,43 @@ class ModelConfig:
     computation_device: Optional[Union[str, torch.device]] = None
     computation_dtype: Optional[torch.dtype] = None
     clear_parameters: bool = False
-    
+
+    @staticmethod
+    def _is_huggingface_cache_path(path: str) -> bool:
+        """Check if path is a HuggingFace cache directory."""
+        path_obj = Path(path)
+        # HF cache structure: .../hub/models--org--model/snapshots/hash/
+        return 'models--' in str(path_obj) and 'snapshots' in str(path_obj).split(os.sep)
+
+    @staticmethod
+    def _resolve_huggingface_cache_path(base_path: str, model_id: str) -> Optional[str]:
+        """
+        Resolve HuggingFace cache path for a model ID.
+
+        HF cache structure: {base_path}/models--{org}--{model}/snapshots/{hash}/
+        This finds the latest snapshot automatically.
+        """
+        # Convert model_id (e.g., "Tongyi-MAI/Z-Image") to HF cache format
+        hf_model_dir = model_id.replace('/', '--')
+        hf_cache_dir = Path(base_path) / f'models--{hf_model_dir}'
+
+        if not hf_cache_dir.exists():
+            return None
+
+        # Look for snapshots directory
+        snapshots_dir = hf_cache_dir / 'snapshots'
+        if not snapshots_dir.exists():
+            return None
+
+        # Find the most recent snapshot (by modification time)
+        snapshots = [d for d in snapshots_dir.iterdir() if d.is_dir()]
+        if not snapshots:
+            return None
+
+        # Use the most recently modified snapshot
+        latest_snapshot = max(snapshots, key=lambda p: p.stat().st_mtime)
+        return str(latest_snapshot)
+
     def check_input(self):
         if self.path is None and self.model_id is None:
             raise ValueError(f"""No valid model files. Please use `ModelConfig(path="xxx")` or `ModelConfig(model_id="xxx/yyy", origin_file_pattern="zzz")`. `skip_download=True` only supports the first one.""")
@@ -92,16 +129,57 @@ class ModelConfig:
         elif self.local_model_path is None:
             self.local_model_path = "./models"
 
+        # Expand user path (e.g., ~/.cache -> /home/user/.cache)
+        self.local_model_path = os.path.expanduser(self.local_model_path)
+
     def download_if_necessary(self):
         self.check_input()
         self.reset_local_model_path()
-        if self.require_downloading():
-            self.download()
+
+        # If path is not set, try to resolve it
+        if self.path is None and self.model_id is not None:
+            # First, try to find in HuggingFace cache format
+            hf_cache_path = self._resolve_huggingface_cache_path(self.local_model_path, self.model_id)
+
+            if hf_cache_path:
+                # Found in HF cache, use that path
+                if self.origin_file_pattern:
+                    pattern = self.parse_original_file_pattern()
+
+                    # Check if pattern is a directory (ends with /)
+                    if self.origin_file_pattern.endswith('/'):
+                        # For directory patterns (like "tokenizer/"), use the directory path itself
+                        dir_path = os.path.join(hf_cache_path, self.origin_file_pattern.rstrip('/'))
+                        if os.path.isdir(dir_path):
+                            self.path = dir_path
+                            print(f"Using HuggingFace cache: {hf_cache_path}")
+                        else:
+                            # Directory doesn't exist in cache, fall through to download
+                            pass
+                    else:
+                        # For file patterns (like "*.safetensors"), glob for files
+                        matched_files = glob.glob(os.path.join(hf_cache_path, pattern))
+                        if matched_files:
+                            self.path = matched_files
+                            print(f"Using HuggingFace cache: {hf_cache_path}")
+                        else:
+                            # Pattern didn't match in HF cache, fall through to download
+                            pass
+                else:
+                    self.path = hf_cache_path
+                    print(f"Using HuggingFace cache: {hf_cache_path}")
+
+        # If still no path, proceed with download or standard path resolution
         if self.path is None:
+            if self.require_downloading():
+                self.download()
+
+            # Try standard path format
             if self.origin_file_pattern is None or self.origin_file_pattern == "":
                 self.path = os.path.join(self.local_model_path, self.model_id)
             else:
                 self.path = glob.glob(os.path.join(self.local_model_path, self.model_id, self.origin_file_pattern))
+
         if isinstance(self.path, list) and len(self.path) == 1:
             self.path = self.path[0]
 

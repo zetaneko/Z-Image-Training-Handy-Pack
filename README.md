@@ -45,14 +45,53 @@ These launcher scripts will:
 2. Install all required dependencies (Pillow, PyTorch, safetensors)
 3. Launch the GUI
 
+## Model Storage Configuration
+
+By default, DiffSynth-Studio downloads models from Hugging Face to `./models` in the project directory. You can customize this location to:
+- Store models on a different drive with more space
+- Share models between multiple projects
+- Use an existing Hugging Face cache directory
+
+**Method 1: Environment Variable (applies to all scripts)**
+```bash
+export DIFFSYNTH_MODEL_BASE_PATH="/path/to/your/models"
+# Example: Use existing HuggingFace cache
+export DIFFSYNTH_MODEL_BASE_PATH="$HOME/.cache/huggingface/hub"
+```
+
+**Method 2: Command-line Argument (training scripts only)**
+```bash
+python train_layer_groups.py --model_base_path "/path/to/your/models" ...
+```
+
+**Method 3: Shell Script Variable**
+Edit the training shell scripts (e.g., `Z-Image-layer-groups.sh`) and uncomment/set:
+```bash
+MODEL_BASE_PATH="/data/ai-models"
+```
+
+Models will be downloaded to `{MODEL_BASE_PATH}/{model-id}/` (e.g., `/data/ai-models/Tongyi-MAI/Z-Image/`).
+
 ## GUI
 
-The GUI provides a tabbed interface with file browsers for each script and displays output in real-time.
+The GUI provides a tabbed interface with file browsers for each script and displays output in real-time. All settings are automatically saved when you run scripts and restored when you reopen the GUI.
+
+**Features:**
+- **Dataset Preparation Tools** - Add prefix, scan & fix images, convert tags, generate metadata
+- **Checkpoint Converter** - Fix DiffSynth model outputs for ComfyUI
+- **Layer Group Training** - Low-VRAM full fine-tuning with comprehensive settings
+- **Settings Persistence** - All your configuration is automatically saved
+- **Real-time Output** - Stream script output directly in the GUI
 
 To run manually (if you have dependencies installed):
 ```bash
 python python-scripts/gui.py
 ```
+
+**Settings Location:**
+- Linux: `~/.config/z-image-training-handy-pack/settings.json`
+- Windows: `%APPDATA%\z-image-training-handy-pack\settings.json`
+- macOS: `~/Library/Application Support/z-image-training-handy-pack/settings.json`
 
 ## Python Scripts (CLI)
 

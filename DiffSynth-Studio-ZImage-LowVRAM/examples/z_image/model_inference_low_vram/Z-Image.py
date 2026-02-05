@@ -1,5 +1,10 @@
 from diffsynth.pipelines.z_image import ZImagePipeline, ModelConfig
 import torch
+import os
+
+# Optional: Set custom model base path for downloaded models
+# Uncomment to override default ./models location:
+# os.environ['DIFFSYNTH_MODEL_BASE_PATH'] = "/path/to/your/models"
 
 vram_config = {
     "offload_dtype": torch.bfloat16,

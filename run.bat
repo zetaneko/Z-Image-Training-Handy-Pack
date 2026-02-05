@@ -24,7 +24,18 @@ call "%VENV_DIR%\Scripts\activate.bat"
 REM Install/upgrade dependencies
 echo Checking dependencies...
 pip install --quiet --upgrade pip
+
+REM Core dependencies (for dataset tools and GUI)
 pip install --quiet pillow torch safetensors
+
+REM Training dependencies (for layer group training)
+pip install --quiet einops tqdm psutil accelerate transformers diffusers
+
+REM Install DiffSynth-Studio in editable mode
+echo Installing DiffSynth-Studio...
+pip install --quiet -e "%SCRIPT_DIR%DiffSynth-Studio-ZImage-LowVRAM"
+
+echo Dependencies installed
 
 REM Launch GUI
 echo Launching GUI...

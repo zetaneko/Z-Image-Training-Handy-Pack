@@ -1786,6 +1786,9 @@ def parse_args():
     # Model args
     parser.add_argument("--model_paths", type=str, default=None)
     parser.add_argument("--model_id_with_origin_paths", type=str, default=None)
+    parser.add_argument("--model_base_path", type=str, default=None,
+                        help="Custom base path for downloading/loading models (default: ./models). "
+                             "Can also be set via DIFFSYNTH_MODEL_BASE_PATH environment variable.")
     parser.add_argument("--tokenizer_path", type=str, default=None)
     parser.add_argument("--trainable_models", type=str, default="dit")
     parser.add_argument("--fp8_models", type=str, default="text_encoder,vae")
@@ -2054,6 +2057,11 @@ def load_image_from_data(image_data, base_path: str):
 
 def main():
     args = parse_args()
+
+    # Set custom model base path if provided
+    if args.model_base_path is not None:
+        os.environ['DIFFSYNTH_MODEL_BASE_PATH'] = args.model_base_path
+        print(f"Using custom model base path: {args.model_base_path}")
 
     # Set random seed for reproducibility
     random.seed(args.seed)
