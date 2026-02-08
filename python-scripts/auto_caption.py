@@ -25,7 +25,9 @@ import argparse
 import base64
 import json
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 import urllib.request
@@ -33,6 +35,9 @@ import urllib.error
 
 # Image extensions to process
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tiff'}
+
+# User-Agent for API requests (Python-urllib default is blocked by Cloudflare)
+_USER_AGENT = 'auto-caption/1.0'
 
 # Default system prompt
 DEFAULT_SYSTEM_PROMPT = """Write a descriptive caption for this image in a formal tone. Focus on the main subjects, their appearance, actions, setting, and mood. Be detailed but concise."""
@@ -99,12 +104,13 @@ def call_lm_studio_api(
     max_tokens: int = 500,
     temperature: float = 0.7,
     timeout: int = 120,
+    api_key: str = "",
 ) -> Optional[str]:
     """
-    Call LM Studio API with an image for captioning.
+    Call an OpenAI-compatible vision API with an image for captioning.
 
     Args:
-        api_url: Base URL for LM Studio API (e.g., http://localhost:1234/v1)
+        api_url: Base URL (e.g., http://localhost:1234/v1)
         image_path: Path to the image file
         system_prompt: System prompt for the model
         user_prompt: User prompt to send with the image
@@ -112,6 +118,7 @@ def call_lm_studio_api(
         max_tokens: Maximum tokens in response
         temperature: Sampling temperature
         timeout: Request timeout in seconds
+        api_key: Optional Bearer token for authenticated endpoints (e.g. VLLM)
 
     Returns:
         Generated caption or None on error
@@ -156,12 +163,14 @@ def call_lm_studio_api(
     url = f"{api_url.rstrip('/')}/chat/completions"
     data = json.dumps(payload).encode('utf-8')
 
+    headers = {'Content-Type': 'application/json', 'User-Agent': _USER_AGENT}
+    if api_key:
+        headers['Authorization'] = f'Bearer {api_key}'
+
     req = urllib.request.Request(
         url,
         data=data,
-        headers={
-            'Content-Type': 'application/json',
-        },
+        headers=headers,
         method='POST'
     )
 
@@ -190,17 +199,129 @@ def call_lm_studio_api(
 def collect_images(input_dir: Path, recursive: bool = True) -> list[Path]:
     """Collect all image files from directory."""
     images = []
+    io_errors = []
 
     if recursive:
         for p in sorted(input_dir.rglob("*")):
-            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS:
-                images.append(p)
+            try:
+                if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS:
+                    images.append(p)
+            except OSError as e:
+                io_errors.append((p, e))
     else:
         for p in sorted(input_dir.iterdir()):
-            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS:
-                images.append(p)
+            try:
+                if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS:
+                    images.append(p)
+            except OSError as e:
+                io_errors.append((p, e))
+
+    if io_errors:
+        print(f"\nWarning: Skipped {len(io_errors)} file(s) due to I/O errors:", file=sys.stderr)
+        for p, e in io_errors[:5]:
+            print(f"  {p}: {e}", file=sys.stderr)
+        if len(io_errors) > 5:
+            print(f"  ... and {len(io_errors) - 5} more", file=sys.stderr)
 
     return images
+
+
+def get_folder_name(image_path: Path, input_dir: Path, level: int) -> str:
+    """
+    Extract folder name at the given depth level relative to input_dir.
+
+    For input_dir=/media/images and image_path=/media/images/gallery1/part1/cat.jpg:
+      level 1 -> 'gallery1'
+      level 2 -> 'part1'
+
+    Returns empty string if the image is not deep enough for the requested level.
+    """
+    try:
+        relative = image_path.relative_to(input_dir)
+    except ValueError:
+        return ""
+    # parts = ('gallery1', 'part1', 'cat.jpg') - last element is the filename
+    folder_parts = relative.parts[:-1]  # exclude filename
+    if level < 1 or level > len(folder_parts):
+        return ""
+    return folder_parts[level - 1]
+
+
+def _process_single_image(
+    image_path: Path,
+    input_dir: Path,
+    api_url: str,
+    system_prompt: str,
+    use_existing_caption: bool,
+    user_prompt: str,
+    model: str,
+    max_tokens: int,
+    temperature: float,
+    overwrite: bool,
+    dry_run: bool,
+    folder_name_level: int,
+    api_key: str = "",
+) -> str:
+    """
+    Process a single image. Returns 'processed', 'skipped', or 'error'.
+    Thread-safe: only reads shared state and writes to its own output file.
+    """
+    try:
+        # Check if output already exists
+        output_path = image_path.with_suffix('.autocaption.txt')
+        if output_path.exists() and not overwrite:
+            return 'skipped'
+
+        # Get existing caption if needed
+        existing_caption = None
+        if use_existing_caption:
+            existing_caption = get_existing_caption(image_path)
+
+        # Get folder name if requested
+        folder_name = ""
+        if folder_name_level > 0:
+            folder_name = get_folder_name(image_path, input_dir, folder_name_level)
+
+        # Build system prompt with substitutions
+        format_kwargs = {
+            'existing_caption': existing_caption or '',
+            'folder_name': folder_name,
+        }
+        try:
+            final_system_prompt = system_prompt.format(**format_kwargs)
+        except (KeyError, IndexError):
+            final_system_prompt = system_prompt
+
+        if dry_run:
+            parts = [f"[DRY RUN] Would process: {image_path.name}"]
+            if folder_name:
+                parts.append(f"  Folder name (level {folder_name_level}): {folder_name}")
+            if existing_caption:
+                parts.append(f"  Existing caption: {existing_caption[:100]}...")
+            print('\n'.join(parts), flush=True)
+            return 'processed'
+
+        # Call API
+        caption = call_lm_studio_api(
+            api_url=api_url,
+            image_path=image_path,
+            system_prompt=final_system_prompt,
+            user_prompt=user_prompt,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            api_key=api_key,
+        )
+
+        if caption:
+            output_path.write_text(caption, encoding='utf-8')
+            return 'processed'
+        else:
+            print(f"Failed to caption: {image_path.name}", flush=True)
+            return 'error'
+    except OSError as e:
+        print(f"I/O error processing {image_path.name}: {e}", file=sys.stderr, flush=True)
+        return 'error'
 
 
 def process_images(
@@ -216,6 +337,9 @@ def process_images(
     overwrite: bool = False,
     delay: float = 0.0,
     dry_run: bool = False,
+    folder_name_level: int = 0,
+    threads: int = 1,
+    api_key: str = "",
 ) -> tuple[int, int, int]:
     """
     Process all images in a directory.
@@ -231,60 +355,59 @@ def process_images(
         return 0, 0, 0
 
     print(f"Found {total} images to process")
+    if threads > 1:
+        print(f"Using {threads} threads")
 
     processed = 0
     skipped = 0
     errors = 0
+    completed = 0
+    lock = threading.Lock()
 
-    for i, image_path in enumerate(images):
-        print_progress(i + 1, total, "Captioning")
+    def on_result(result: str):
+        nonlocal processed, skipped, errors, completed
+        with lock:
+            if result == 'processed':
+                processed += 1
+            elif result == 'skipped':
+                skipped += 1
+            else:
+                errors += 1
+            completed += 1
+            print_progress(completed, total, "Captioning")
 
-        # Check if output already exists
-        output_path = image_path.with_suffix('.autocaption.txt')
-        if output_path.exists() and not overwrite:
-            skipped += 1
-            continue
+    common_kwargs = dict(
+        input_dir=input_dir,
+        api_url=api_url,
+        system_prompt=system_prompt,
+        use_existing_caption=use_existing_caption,
+        user_prompt=user_prompt,
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        overwrite=overwrite,
+        dry_run=dry_run,
+        folder_name_level=folder_name_level,
+        api_key=api_key,
+    )
 
-        # Get existing caption if needed
-        existing_caption = None
-        if use_existing_caption:
-            existing_caption = get_existing_caption(image_path)
-
-        # Build system prompt
-        if existing_caption and use_existing_caption:
-            final_system_prompt = system_prompt.format(existing_caption=existing_caption)
-        else:
-            final_system_prompt = system_prompt
-
-        if dry_run:
-            print(f"\n[DRY RUN] Would process: {image_path.name}")
-            if existing_caption:
-                print(f"  Existing caption: {existing_caption[:100]}...")
-            processed += 1
-            continue
-
-        # Call API
-        caption = call_lm_studio_api(
-            api_url=api_url,
-            image_path=image_path,
-            system_prompt=final_system_prompt,
-            user_prompt=user_prompt,
-            model=model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-
-        if caption:
-            # Write caption to .autocaption.txt
-            output_path.write_text(caption, encoding='utf-8')
-            processed += 1
-        else:
-            errors += 1
-            print(f"\nFailed to caption: {image_path.name}")
-
-        # Delay between requests if specified
-        if delay > 0 and i < total - 1:
-            time.sleep(delay)
+    if threads <= 1:
+        # Single-threaded path (preserves original delay behaviour)
+        for i, image_path in enumerate(images):
+            result = _process_single_image(image_path=image_path, **common_kwargs)
+            on_result(result)
+            if delay > 0 and i < total - 1:
+                time.sleep(delay)
+    else:
+        # Multi-threaded path
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            futures = {
+                executor.submit(_process_single_image, image_path=img, **common_kwargs): img
+                for img in images
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                on_result(result)
 
     # Clear progress line
     if sys.stdout.isatty():
@@ -293,15 +416,42 @@ def process_images(
     return processed, skipped, errors
 
 
-def test_api_connection(api_url: str) -> bool:
-    """Test if the API is reachable."""
+def normalize_api_url(api_url: str) -> str:
+    """Normalize API URL to fix common mistakes.
+
+    Fixes http:// with port 443 to https:// (e.g. RunPod proxy URLs).
+    """
+    url = api_url.strip().rstrip('/')
+    # http://host:443 or http://host:443/path -> https://host or https://host/path
+    if url.startswith('http://') and ':443' in url:
+        url = url.replace('http://', 'https://', 1)
+        # Remove redundant :443 from https URLs
+        url = url.replace(':443', '', 1)
+    return url
+
+
+def test_api_connection(api_url: str, api_key: str = "") -> tuple[bool, str]:
+    """Test if the API is reachable.
+
+    Returns:
+        Tuple of (success, message) with details about the result.
+    """
+    url = f"{api_url.rstrip('/')}/models"
+    headers = {'User-Agent': _USER_AGENT}
+    if api_key:
+        headers['Authorization'] = f'Bearer {api_key}'
+    req = urllib.request.Request(url, headers=headers, method='GET')
     try:
-        url = f"{api_url.rstrip('/')}/models"
-        req = urllib.request.Request(url, method='GET')
-        with urllib.request.urlopen(req, timeout=5) as response:
-            return response.status == 200
-    except Exception:
-        return False
+        with urllib.request.urlopen(req, timeout=10) as response:
+            if response.status == 200:
+                return True, "OK"
+            return False, f"Unexpected status: {response.status}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}: {e.reason}"
+    except urllib.error.URLError as e:
+        return False, f"Connection error: {e.reason}"
+    except Exception as e:
+        return False, str(e)
 
 
 def main():
@@ -339,6 +489,9 @@ Output:
                         help='LM Studio API URL (default: http://localhost:1234/v1)')
     parser.add_argument('--model', '-m', type=str, default='',
                         help='Model name (default: use currently loaded model)')
+    parser.add_argument('--api-key', '-k', type=str, default='',
+                        help='API key for authenticated endpoints (e.g. VLLM). '
+                             'Sent as Bearer token in Authorization header.')
 
     # Prompt settings
     parser.add_argument('--system-prompt', '-s', type=str, default=None,
@@ -347,6 +500,10 @@ Output:
                         help='User prompt sent with image')
     parser.add_argument('--use-existing-caption', '-e', action='store_true',
                         help='Include existing .txt caption in system prompt for extension')
+    parser.add_argument('--folder-name-level', type=int, default=0,
+                        help='Include subfolder name in system prompt at this depth level '
+                             'relative to --input (0=disabled, 1=first subfolder, 2=second, etc.). '
+                             'Use {folder_name} placeholder in system prompt.')
 
     # Generation settings
     parser.add_argument('--max-tokens', type=int, default=500,
@@ -361,10 +518,16 @@ Output:
                         help='Overwrite existing .autocaption.txt files')
     parser.add_argument('--delay', '-d', type=float, default=0.0,
                         help='Delay between API calls in seconds (default: 0)')
+    parser.add_argument('--threads', '-t', type=int, default=1,
+                        help='Number of concurrent API requests (default: 1). '
+                             'Increase to saturate network throughput to remote LM Studio instances.')
     parser.add_argument('--dry-run', action='store_true',
                         help='Preview what would be processed without making API calls')
 
     args = parser.parse_args()
+
+    # Normalize API URL (fixes http://:443 -> https://)
+    args.api_url = normalize_api_url(args.api_url)
 
     # Validate input
     if not args.input.exists():
@@ -380,14 +543,24 @@ Output:
         # Add placeholder for existing caption if using that feature
         if args.use_existing_caption and '{existing_caption}' not in system_prompt:
             system_prompt += "\n\nExisting tags to extend: {existing_caption}"
+        # Add placeholder for folder name if using that feature
+        if args.folder_name_level > 0 and '{folder_name}' not in system_prompt:
+            system_prompt += "\n\nThis image is from the category: {folder_name}"
     elif args.use_existing_caption:
         system_prompt = DEFAULT_SYSTEM_PROMPT_WITH_TAGS
     else:
         system_prompt = DEFAULT_SYSTEM_PROMPT
 
+    # Add folder name placeholder to default prompts if needed
+    if args.folder_name_level > 0 and '{folder_name}' not in system_prompt:
+        system_prompt += "\n\nThis image is from the category: {folder_name}"
+
     print(f"Input folder    : {args.input}")
     print(f"API URL         : {args.api_url}")
+    print(f"API Key         : {'set' if args.api_key else 'none'}")
     print(f"Use existing    : {'yes' if args.use_existing_caption else 'no'}")
+    print(f"Folder name lvl : {args.folder_name_level if args.folder_name_level > 0 else 'disabled'}")
+    print(f"Threads         : {args.threads}")
     print(f"Recursive       : {'yes' if not args.no_recursive else 'no'}")
     print(f"Overwrite       : {'yes' if args.overwrite else 'no'}")
     if args.dry_run:
@@ -397,13 +570,13 @@ Output:
     # Test API connection (skip for dry run)
     if not args.dry_run:
         print("Testing API connection...", end=" ")
-        if test_api_connection(args.api_url):
+        ok, msg = test_api_connection(args.api_url, api_key=args.api_key)
+        if ok:
             print("OK")
         else:
             print("FAILED")
-            print(f"\nCould not connect to LM Studio at {args.api_url}")
-            print("Make sure LM Studio is running with a vision model loaded.")
-            print("Enable the local server in LM Studio: Developer -> Local Server")
+            print(f"\nCould not connect to API at {args.api_url}")
+            print(f"Error: {msg}")
             return 1
 
     print()
@@ -422,6 +595,9 @@ Output:
         overwrite=args.overwrite,
         delay=args.delay,
         dry_run=args.dry_run,
+        folder_name_level=args.folder_name_level,
+        threads=args.threads,
+        api_key=args.api_key,
     )
 
     print()

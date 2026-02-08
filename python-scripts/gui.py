@@ -16,6 +16,7 @@ from pathlib import Path
 import json
 import os
 from typing import Dict, Any
+from caption_inspector import CaptionInspectorTab
 
 
 def get_config_dir() -> Path:
@@ -635,6 +636,13 @@ Use these tags as a starting point to write a natural, flowing description. Focu
         ttk.Entry(model_frame, textvariable=self.model_var, width=40).pack(side='left', fill='x', expand=True)
         ttk.Label(model_frame, text="(Leave empty for loaded model)", font=('TkDefaultFont', 8)).pack(side='left', padx=(5, 0))
 
+        key_frame = ttk.Frame(api_frame)
+        key_frame.pack(fill='x', pady=3)
+        ttk.Label(key_frame, text="API Key:", width=15, anchor='e').pack(side='left', padx=(0, 5))
+        self.api_key_var = tk.StringVar(value="")
+        ttk.Entry(key_frame, textvariable=self.api_key_var, width=40, show="*").pack(side='left', fill='x', expand=True)
+        ttk.Label(key_frame, text="(Optional — for VLLM or authenticated endpoints)", font=('TkDefaultFont', 8)).pack(side='left', padx=(5, 0))
+
         # Caption Settings
         caption_frame = ttk.LabelFrame(scrollable_frame, text="Caption Settings", padding=10)
         caption_frame.pack(fill='x', pady=5)
@@ -642,6 +650,17 @@ Use these tags as a starting point to write a natural, flowing description. Focu
         self.use_existing_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(caption_frame, text="Include existing .txt caption in prompt (for extending tags)",
                        variable=self.use_existing_var, command=self._update_prompt_preview).pack(anchor='w', pady=3)
+
+        # Folder name level
+        folder_frame = ttk.Frame(caption_frame)
+        folder_frame.pack(fill='x', pady=3)
+        ttk.Label(folder_frame, text="Folder Name Level:", width=18, anchor='e').pack(side='left', padx=(0, 5))
+        self.folder_name_level_var = tk.IntVar(value=0)
+        ttk.Spinbox(folder_frame, from_=0, to=10, textvariable=self.folder_name_level_var, width=5).pack(side='left')
+        ttk.Label(folder_frame, text="(0=disabled, 1=first subfolder after input, 2=second, etc.)",
+                 font=('TkDefaultFont', 8)).pack(side='left', padx=(10, 0))
+        ttk.Label(caption_frame, text="Use {folder_name} placeholder in system prompt to insert the subfolder name",
+                 font=('TkDefaultFont', 8), foreground='gray').pack(anchor='w')
 
         # System prompt
         prompt_label_frame = ttk.Frame(caption_frame)
@@ -680,12 +699,19 @@ Use these tags as a starting point to write a natural, flowing description. Focu
         ttk.Spinbox(temp_frame, from_=0.0, to=2.0, increment=0.1, textvariable=self.temperature_var, width=10).pack(side='left')
         ttk.Label(temp_frame, text="(0.0 = deterministic, higher = more creative)", font=('TkDefaultFont', 8)).pack(side='left', padx=(10, 0))
 
+        threads_frame = ttk.Frame(gen_frame)
+        threads_frame.pack(fill='x', pady=3)
+        ttk.Label(threads_frame, text="Threads:", width=15, anchor='e').pack(side='left', padx=(0, 5))
+        self.threads_var = tk.IntVar(value=1)
+        ttk.Spinbox(threads_frame, from_=1, to=64, increment=1, textvariable=self.threads_var, width=10).pack(side='left')
+        ttk.Label(threads_frame, text="(Concurrent API requests — increase for remote servers)", font=('TkDefaultFont', 8)).pack(side='left', padx=(10, 0))
+
         delay_frame = ttk.Frame(gen_frame)
         delay_frame.pack(fill='x', pady=3)
         ttk.Label(delay_frame, text="Delay (seconds):", width=15, anchor='e').pack(side='left', padx=(0, 5))
         self.delay_var = tk.DoubleVar(value=0.0)
         ttk.Spinbox(delay_frame, from_=0.0, to=10.0, increment=0.5, textvariable=self.delay_var, width=10).pack(side='left')
-        ttk.Label(delay_frame, text="(Between API calls, to avoid rate limits)", font=('TkDefaultFont', 8)).pack(side='left', padx=(10, 0))
+        ttk.Label(delay_frame, text="(Between API calls, single-thread only)", font=('TkDefaultFont', 8)).pack(side='left', padx=(10, 0))
 
         # Buttons frame
         btn_frame = ttk.Frame(scrollable_frame)
@@ -744,15 +770,27 @@ Use these tags as a starting point to write a natural, flowing description. Focu
     def _test_connection(self):
         """Test API connection."""
         import urllib.request
+        from auto_caption import normalize_api_url, _USER_AGENT
         self.runner.clear_output()
-        self.runner.append_output(f"Testing connection to {self.api_url_var.get()}...\n")
+
+        # Normalize the URL and update the field if it changed
+        raw_url = self.api_url_var.get()
+        normalized = normalize_api_url(raw_url)
+        if normalized != raw_url:
+            self.api_url_var.set(normalized)
+            self.runner.append_output(f"URL corrected: {raw_url}\n         -> {normalized}\n\n")
+
+        self.runner.append_output(f"Testing connection to {normalized}...\n")
 
         try:
-            url = f"{self.api_url_var.get().rstrip('/')}/models"
-            req = urllib.request.Request(url, method='GET')
-            with urllib.request.urlopen(req, timeout=5) as response:
+            url = f"{normalized.rstrip('/')}/models"
+            headers = {'User-Agent': _USER_AGENT}
+            if self.api_key_var.get():
+                headers['Authorization'] = f'Bearer {self.api_key_var.get()}'
+            req = urllib.request.Request(url, headers=headers, method='GET')
+            with urllib.request.urlopen(req, timeout=10) as response:
                 if response.status == 200:
-                    self.runner.append_output("✓ Connection successful!\n")
+                    self.runner.append_output("Connection successful!\n")
                     # Try to get model info
                     import json
                     data = json.loads(response.read().decode('utf-8'))
@@ -761,12 +799,13 @@ Use these tags as a starting point to write a natural, flowing description. Focu
                         for model in data['data']:
                             self.runner.append_output(f"  - {model.get('id', 'unknown')}\n")
                 else:
-                    self.runner.append_output(f"✗ Unexpected status: {response.status}\n")
+                    self.runner.append_output(f"Unexpected status: {response.status}\n")
         except Exception as e:
-            self.runner.append_output(f"✗ Connection failed: {e}\n")
-            self.runner.append_output("\nMake sure LM Studio is running with:\n")
-            self.runner.append_output("  1. A vision model loaded (e.g., llava, moondream)\n")
-            self.runner.append_output("  2. Local server enabled (Developer -> Local Server -> Start)\n")
+            self.runner.append_output(f"Connection failed: {e}\n")
+            self.runner.append_output("\nMake sure the API server is running with:\n")
+            self.runner.append_output("  1. A vision model loaded\n")
+            self.runner.append_output("  2. The server started and accessible\n")
+            self.runner.append_output("\nFor remote servers (e.g. RunPod), use https:// not http://\n")
 
     def _stop(self):
         """Stop the running script."""
@@ -784,10 +823,16 @@ Use these tags as a starting point to write a natural, flowing description. Focu
         cmd.extend(['--api-url', self.api_url_var.get()])
         if self.model_var.get():
             cmd.extend(['--model', self.model_var.get()])
+        if self.api_key_var.get():
+            cmd.extend(['--api-key', self.api_key_var.get()])
 
         # Caption settings
         if self.use_existing_var.get():
             cmd.append('--use-existing-caption')
+
+        folder_level = self.folder_name_level_var.get()
+        if folder_level > 0:
+            cmd.extend(['--folder-name-level', str(folder_level)])
 
         system_prompt = self.system_prompt_text.get('1.0', 'end').strip()
         if system_prompt:
@@ -801,6 +846,9 @@ Use these tags as a starting point to write a natural, flowing description. Focu
         cmd.extend(['--max-tokens', str(self.max_tokens_var.get())])
         cmd.extend(['--temperature', str(self.temperature_var.get())])
         cmd.extend(['--delay', str(self.delay_var.get())])
+        threads = self.threads_var.get()
+        if threads > 1:
+            cmd.extend(['--threads', str(threads)])
 
         # Processing options
         if not self.recursive_var.get():
@@ -840,11 +888,14 @@ Use these tags as a starting point to write a natural, flowing description. Focu
             'input_path': self.input_path.get(),
             'api_url': self.api_url_var.get(),
             'model': self.model_var.get(),
+            'api_key': self.api_key_var.get(),
             'use_existing': self.use_existing_var.get(),
+            'folder_name_level': self.folder_name_level_var.get(),
             'system_prompt': self.system_prompt_text.get('1.0', 'end').strip(),
             'user_prompt': self.user_prompt_var.get(),
             'max_tokens': self.max_tokens_var.get(),
             'temperature': self.temperature_var.get(),
+            'threads': self.threads_var.get(),
             'delay': self.delay_var.get(),
             'recursive': self.recursive_var.get(),
             'overwrite': self.overwrite_var.get()
@@ -855,7 +906,9 @@ Use these tags as a starting point to write a natural, flowing description. Focu
         self.input_path.set(settings.get('input_path', ''))
         self.api_url_var.set(settings.get('api_url', 'http://localhost:1234/v1'))
         self.model_var.set(settings.get('model', ''))
+        self.api_key_var.set(settings.get('api_key', ''))
         self.use_existing_var.set(settings.get('use_existing', False))
+        self.folder_name_level_var.set(settings.get('folder_name_level', 0))
 
         system_prompt = settings.get('system_prompt', self.default_prompt)
         self.system_prompt_text.delete('1.0', 'end')
@@ -864,7 +917,124 @@ Use these tags as a starting point to write a natural, flowing description. Focu
         self.user_prompt_var.set(settings.get('user_prompt', 'Please caption this image.'))
         self.max_tokens_var.set(settings.get('max_tokens', 500))
         self.temperature_var.set(settings.get('temperature', 0.7))
+        self.threads_var.set(settings.get('threads', 1))
         self.delay_var.set(settings.get('delay', 0.0))
+        self.recursive_var.set(settings.get('recursive', True))
+        self.overwrite_var.set(settings.get('overwrite', False))
+
+    def save_settings(self):
+        """Save current settings."""
+        self.settings_manager.set_tab_settings(self.tab_name, self.get_settings())
+
+    def load_settings(self):
+        """Load saved settings."""
+        settings = self.settings_manager.get_tab_settings(self.tab_name)
+        if settings:
+            self.set_settings(settings)
+
+
+class QualityCaptionTab(ttk.Frame):
+    """Tab for quality_caption.py script - image quality analysis."""
+
+    def __init__(self, parent, script_dir: Path, output_widget: scrolledtext.ScrolledText, settings_manager: SettingsManager):
+        super().__init__(parent, padding=10)
+        self.script_path = script_dir / 'quality_caption.py'
+        self.output_widget = output_widget
+        self.settings_manager = settings_manager
+        self.tab_name = 'quality_caption'
+
+        # Description
+        desc = ttk.Label(self, text="Analyze image quality metrics and generate natural-language quality captions.\n"
+                                    "Computes sharpness, brightness, contrast, and overall quality (10 levels each)\n"
+                                    "and writes results to .quality.txt files alongside images.",
+                        wraplength=600, justify='left')
+        desc.pack(anchor='w', pady=(0, 15))
+
+        # Input folder
+        self.input_path = PathSelector(self, "Input Folder:", mode='folder')
+        self.input_path.pack(fill='x', pady=5)
+
+        # Options
+        options_frame = ttk.Frame(self)
+        options_frame.pack(fill='x', pady=10)
+        ttk.Label(options_frame, text="Options:", width=20, anchor='e').pack(side='left', padx=(0, 5))
+        self.recursive_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(options_frame, text="Traverse subdirectories", variable=self.recursive_var).pack(side='left')
+        self.overwrite_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(options_frame, text="Overwrite existing .quality.txt", variable=self.overwrite_var).pack(side='left', padx=(20, 0))
+
+        # Buttons frame
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(pady=15)
+
+        self.dry_run_btn = ttk.Button(btn_frame, text="Dry Run", command=self._dry_run, width=12)
+        self.dry_run_btn.pack(side='left', padx=5)
+
+        self.run_btn = ttk.Button(btn_frame, text="Run", command=self._run, width=12)
+        self.run_btn.pack(side='left', padx=5)
+
+        self.stop_btn = ttk.Button(btn_frame, text="Stop", command=self._stop, state='disabled', width=10)
+        self.stop_btn.pack(side='left', padx=5)
+
+        self.runner = ScriptRunner(output_widget, self.run_btn, self.stop_btn)
+
+        # Load saved settings
+        self.load_settings()
+
+    def _stop(self):
+        """Stop the running script."""
+        self.runner.stop()
+
+    def _build_cmd(self, dry_run: bool = False) -> list[str]:
+        """Build the command to run."""
+        input_path = self.input_path.get()
+        if not input_path:
+            return None
+
+        cmd = [sys.executable, str(self.script_path), '--input', input_path]
+
+        if not self.recursive_var.get():
+            cmd.append('--no-recursive')
+        if self.overwrite_var.get():
+            cmd.append('--overwrite')
+        if dry_run:
+            cmd.append('--dry-run')
+
+        return cmd
+
+    def _dry_run(self):
+        """Run in dry-run mode."""
+        if not self.input_path.get():
+            self.runner.clear_output()
+            self.runner.append_output("Error: Please select an input folder\n")
+            return
+
+        cmd = self._build_cmd(dry_run=True)
+        self.save_settings()
+        self.runner.run(cmd)
+
+    def _run(self):
+        """Run the quality analysis."""
+        if not self.input_path.get():
+            self.runner.clear_output()
+            self.runner.append_output("Error: Please select an input folder\n")
+            return
+
+        cmd = self._build_cmd(dry_run=False)
+        self.save_settings()
+        self.runner.run(cmd)
+
+    def get_settings(self) -> Dict[str, Any]:
+        """Get current tab settings."""
+        return {
+            'input_path': self.input_path.get(),
+            'recursive': self.recursive_var.get(),
+            'overwrite': self.overwrite_var.get(),
+        }
+
+    def set_settings(self, settings: Dict[str, Any]):
+        """Set tab settings."""
+        self.input_path.set(settings.get('input_path', ''))
         self.recursive_var.set(settings.get('recursive', True))
         self.overwrite_var.set(settings.get('overwrite', False))
 
@@ -1215,6 +1385,10 @@ class App(tk.Tk):
                          text="Generate Metadata")
         self.notebook.add(AutoCaptionTab(self.notebook, self.script_dir, self.output_text, self.settings_manager),
                          text="Auto Caption")
+        self.notebook.add(QualityCaptionTab(self.notebook, self.script_dir, self.output_text, self.settings_manager),
+                         text="Quality Caption")
+        self.notebook.add(CaptionInspectorTab(self.notebook, self.script_dir, self.output_text, self.settings_manager),
+                         text="Caption Inspector")
         self.notebook.add(FixDiffSynthTab(self.notebook, self.script_dir, self.output_text, self.settings_manager),
                          text="Fix DiffSynth Output")
         self.notebook.add(LayerGroupTrainingTab(self.notebook, self.project_root, self.output_text, self.settings_manager),

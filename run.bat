@@ -26,7 +26,7 @@ echo Checking dependencies...
 pip install --quiet --upgrade pip
 
 REM Core dependencies (for dataset tools and GUI)
-pip install --quiet pillow torch safetensors
+pip install --quiet pillow torch safetensors image-quality-analysis
 
 REM Training dependencies (for layer group training)
 pip install --quiet einops tqdm psutil accelerate transformers diffusers
