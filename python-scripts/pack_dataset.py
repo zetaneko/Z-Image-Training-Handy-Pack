@@ -101,7 +101,7 @@ def build_combined_caption(image_path: Path, caption_suffixes: list[str]) -> str
     # 1. Check for all.txt in the same folder
     all_txt = image_path.parent / 'all.txt'
     if all_txt.exists():
-        text = all_txt.read_text(encoding='utf-8').strip()
+        text = all_txt.read_text(encoding='utf-8', errors='replace').strip()
         if text:
             parts.append(text)
 
@@ -115,19 +115,19 @@ def build_combined_caption(image_path: Path, caption_suffixes: list[str]) -> str
         if suffix == '.autocaption.txt':
             # Special handling: use .autocaption.txt if exists, else fall back to .txt
             if caption_file.exists():
-                text = caption_file.read_text(encoding='utf-8').strip()
+                text = caption_file.read_text(encoding='utf-8', errors='replace').strip()
                 if text:
                     parts.append(text)
             else:
                 # Fallback to original .txt
                 fallback = image_path.with_suffix('.txt')
                 if fallback.exists():
-                    text = fallback.read_text(encoding='utf-8').strip()
+                    text = fallback.read_text(encoding='utf-8', errors='replace').strip()
                     if text:
                         parts.append(text)
         else:
             if caption_file.exists():
-                text = caption_file.read_text(encoding='utf-8').strip()
+                text = caption_file.read_text(encoding='utf-8', errors='replace').strip()
                 if text:
                     parts.append(text)
 
@@ -167,6 +167,20 @@ def get_last_chunk_info(archive_path: Path) -> tuple[int, int, int]:
         )
 
 
+def has_descriptive_caption(image_path: Path) -> bool:
+    """
+    Check if an image has a descriptive caption file (.autocaption.txt or .txt).
+
+    Supplementary files like .score.txt or .quality.txt don't count as
+    descriptive captions on their own.
+    """
+    stem = image_path.stem
+    folder = image_path.parent
+    autocaption = folder / (stem + '.autocaption.txt')
+    txt = image_path.with_suffix('.txt')
+    return autocaption.exists() or txt.exists()
+
+
 def pack_dataset(
     input_dir: Path,
     output_base: Path,
@@ -174,6 +188,7 @@ def pack_dataset(
     compute_checksums: bool = True,
     update_mode: bool = False,
     caption_suffixes: list[str] | None = None,
+    skip_uncaptioned: bool = False,
 ) -> list[Path]:
     """
     Pack a dataset folder into chunked zitpack archives.
@@ -186,6 +201,7 @@ def pack_dataset(
         update_mode: If True, only pack new files not in existing archives
         caption_suffixes: Ordered list of caption file suffixes to concatenate.
                          None uses DEFAULT_CAPTION_SUFFIXES.
+        skip_uncaptioned: If True, skip images that have no .autocaption.txt or .txt file.
 
     Returns:
         List of created/modified archive paths
@@ -254,6 +270,15 @@ def pack_dataset(
         print(f"Skipped {skipped} corrupt image(s)")
 
     image_files = valid_files
+
+    # Filter out images without descriptive captions if requested
+    if skip_uncaptioned:
+        captioned = [p for p in image_files if has_descriptive_caption(p)]
+        uncaptioned_count = len(image_files) - len(captioned)
+        if uncaptioned_count:
+            print(f"Skipped {uncaptioned_count} image(s) without .txt or .autocaption.txt")
+        image_files = captioned
+
     if not image_files:
         print("No valid images to pack.")
         return existing_archives if update_mode else []
@@ -446,6 +471,9 @@ Output:
                              '(default: %(default)s). '
                              'all.txt in each folder is always included first. '
                              '.autocaption.txt falls back to .txt if not found.')
+    parser.add_argument('--skip-uncaptioned', action='store_true',
+                        help='Skip images that have no .txt or .autocaption.txt file. '
+                             'Supplementary files like .score.txt do not count.')
 
     args = parser.parse_args()
 
@@ -472,6 +500,7 @@ Output:
     print(f"Chunk size      : {args.chunk_size} MB")
     print(f"Checksums       : {'disabled' if args.no_checksums else 'enabled'}")
     print(f"Update mode     : {'enabled' if args.update else 'disabled'}")
+    print(f"Skip uncaptioned: {'enabled' if args.skip_uncaptioned else 'disabled'}")
     print(f"Caption suffixes: {', '.join(caption_suffixes)}")
     print(f"  (all.txt in each folder is always included first)")
     print()
@@ -483,6 +512,7 @@ Output:
         compute_checksums=not args.no_checksums,
         update_mode=args.update,
         caption_suffixes=caption_suffixes,
+        skip_uncaptioned=args.skip_uncaptioned,
     )
 
     if result:

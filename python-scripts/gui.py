@@ -1084,12 +1084,33 @@ class LayerGroupTrainingTab(ttk.Frame):
         dataset_frame = ttk.LabelFrame(scrollable_frame, text="Dataset Settings", padding=10)
         dataset_frame.pack(fill='x', pady=5)
 
-        self.dataset_path = PathSelector(dataset_frame, "Dataset Folder:", mode='folder')
+        # Dataset source selector
+        source_frame = ttk.Frame(dataset_frame)
+        source_frame.pack(fill='x', pady=(0, 5))
+        ttk.Label(source_frame, text="Dataset Source:", width=20, anchor='e').pack(side='left', padx=(0, 5))
+        self.dataset_source_var = tk.StringVar(value="folder")
+        ttk.Radiobutton(source_frame, text="Folder + CSV", variable=self.dataset_source_var,
+                        value="folder", command=self._update_dataset_source).pack(side='left')
+        ttk.Radiobutton(source_frame, text="Zitpack Archives", variable=self.dataset_source_var,
+                        value="zitpack", command=self._update_dataset_source).pack(side='left', padx=(15, 0))
+
+        # Folder mode widgets
+        self.folder_widgets_frame = ttk.Frame(dataset_frame)
+        self.folder_widgets_frame.pack(fill='x')
+
+        self.dataset_path = PathSelector(self.folder_widgets_frame, "Dataset Folder:", mode='folder')
         self.dataset_path.pack(fill='x', pady=3)
 
-        self.metadata_path = PathSelector(dataset_frame, "Metadata CSV:", mode='open')
+        self.metadata_path = PathSelector(self.folder_widgets_frame, "Metadata CSV:", mode='open')
         self.metadata_path.pack(fill='x', pady=3)
-        ttk.Label(dataset_frame, text="(Leave empty for <dataset>/metadata.csv)", font=('TkDefaultFont', 8)).pack(anchor='e')
+        ttk.Label(self.folder_widgets_frame, text="(Leave empty for <dataset>/metadata.csv)", font=('TkDefaultFont', 8)).pack(anchor='e')
+
+        # Zitpack mode widgets
+        self.zitpack_widgets_frame = ttk.Frame(dataset_frame)
+
+        self.zitpack_path = PathSelector(self.zitpack_widgets_frame, "Zitpack Directory:", mode='folder')
+        self.zitpack_path.pack(fill='x', pady=3)
+        ttk.Label(self.zitpack_widgets_frame, text="(Directory containing .zitpack files from Pack Dataset tab)", font=('TkDefaultFont', 8)).pack(anchor='e')
 
         repeat_frame = ttk.Frame(dataset_frame)
         repeat_frame.pack(fill='x', pady=3)
@@ -1214,25 +1235,41 @@ class LayerGroupTrainingTab(ttk.Frame):
         # Load saved settings
         self.load_settings()
 
+    def _update_dataset_source(self):
+        """Show/hide dataset widgets based on selected source."""
+        if self.dataset_source_var.get() == "folder":
+            self.zitpack_widgets_frame.pack_forget()
+            self.folder_widgets_frame.pack(fill='x')
+        else:
+            self.folder_widgets_frame.pack_forget()
+            self.zitpack_widgets_frame.pack(fill='x')
+
     def _stop(self):
         """Stop the running training."""
         self.runner.stop()
 
     def _run(self):
-        dataset_path = self.dataset_path.get()
-        if not dataset_path:
-            self.runner.clear_output()
-            self.runner.append_output("Error: Please select a dataset folder\n")
-            return
+        source = self.dataset_source_var.get()
 
-        # Build command
-        cmd = [sys.executable, str(self.script_path),
-               '--dataset_base_path', dataset_path]
-
-        # Metadata path
-        metadata_path = self.metadata_path.get()
-        if metadata_path:
-            cmd.extend(['--dataset_metadata_path', metadata_path])
+        if source == "zitpack":
+            zitpack_path = self.zitpack_path.get()
+            if not zitpack_path:
+                self.runner.clear_output()
+                self.runner.append_output("Error: Please select a zitpack directory\n")
+                return
+            cmd = [sys.executable, str(self.script_path),
+                   '--zitpacks', zitpack_path]
+        else:
+            dataset_path = self.dataset_path.get()
+            if not dataset_path:
+                self.runner.clear_output()
+                self.runner.append_output("Error: Please select a dataset folder\n")
+                return
+            cmd = [sys.executable, str(self.script_path),
+                   '--dataset_base_path', dataset_path]
+            metadata_path = self.metadata_path.get()
+            if metadata_path:
+                cmd.extend(['--dataset_metadata_path', metadata_path])
 
         # Dataset settings
         cmd.extend([
@@ -1288,8 +1325,10 @@ class LayerGroupTrainingTab(ttk.Frame):
     def get_settings(self) -> Dict[str, Any]:
         """Get current tab settings."""
         return {
+            'dataset_source': self.dataset_source_var.get(),
             'dataset_path': self.dataset_path.get(),
             'metadata_path': self.metadata_path.get(),
+            'zitpack_path': self.zitpack_path.get(),
             'dataset_repeat': self.dataset_repeat_var.get(),
             'max_pixels': self.max_pixels_var.get(),
             'model_base_path': self.model_base_path.get(),
@@ -1307,8 +1346,11 @@ class LayerGroupTrainingTab(ttk.Frame):
 
     def set_settings(self, settings: Dict[str, Any]):
         """Set tab settings."""
+        self.dataset_source_var.set(settings.get('dataset_source', 'folder'))
         self.dataset_path.set(settings.get('dataset_path', ''))
         self.metadata_path.set(settings.get('metadata_path', ''))
+        self.zitpack_path.set(settings.get('zitpack_path', ''))
+        self._update_dataset_source()
         self.dataset_repeat_var.set(settings.get('dataset_repeat', 25))
         self.max_pixels_var.set(settings.get('max_pixels', 262144))
         self.model_base_path.set(settings.get('model_base_path', ''))
@@ -1395,6 +1437,8 @@ class PackDatasetTab(ttk.Frame):
         ttk.Checkbutton(options_frame, text="Update mode (only pack new files)", variable=self.update_var).pack(side='left')
         self.no_checksums_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(options_frame, text="Disable checksums", variable=self.no_checksums_var).pack(side='left', padx=(20, 0))
+        self.skip_uncaptioned_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(options_frame, text="Skip uncaptioned images", variable=self.skip_uncaptioned_var).pack(side='left', padx=(20, 0))
 
         # Buttons frame
         btn_frame = ttk.Frame(self)
@@ -1441,6 +1485,8 @@ class PackDatasetTab(ttk.Frame):
             cmd.append('--update')
         if self.no_checksums_var.get():
             cmd.append('--no-checksums')
+        if self.skip_uncaptioned_var.get():
+            cmd.append('--skip-uncaptioned')
 
         self.save_settings()
         self.runner.run(cmd)
@@ -1453,6 +1499,7 @@ class PackDatasetTab(ttk.Frame):
             'suffixes': self.suffixes_var.get(),
             'update_mode': self.update_var.get(),
             'no_checksums': self.no_checksums_var.get(),
+            'skip_uncaptioned': self.skip_uncaptioned_var.get(),
         }
 
     def set_settings(self, settings: Dict[str, Any]):
@@ -1462,6 +1509,7 @@ class PackDatasetTab(ttk.Frame):
         self.suffixes_var.set(settings.get('suffixes', '.score.txt, .autocaption.txt, .quality.txt'))
         self.update_var.set(settings.get('update_mode', False))
         self.no_checksums_var.set(settings.get('no_checksums', False))
+        self.skip_uncaptioned_var.set(settings.get('skip_uncaptioned', False))
 
     def save_settings(self):
         self.settings_manager.set_tab_settings(self.tab_name, self.get_settings())

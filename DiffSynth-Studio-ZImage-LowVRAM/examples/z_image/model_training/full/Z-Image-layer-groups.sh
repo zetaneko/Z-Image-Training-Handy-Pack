@@ -58,8 +58,13 @@ echo "=============================================="
 #   MODEL_BASE_PATH="/mnt/storage/models"
 
 # Dataset settings
+# Option A: Folder with images + metadata.csv (traditional)
 DATASET_PATH="/path"
 DATASET_METADATA="${DATASET_PATH}/metadata.csv"
+# Option B: Zitpack archives (packed dataset)
+# Set ZITPACK_DIR to a directory containing .zitpack files to use instead of DATASET_PATH.
+# Create zitpacks with: python3 python-scripts/pack_dataset.py --input <folder> --output <dir>
+# ZITPACK_DIR="/path/to/zitpacks"
 DATASET_REPEAT=25
 MAX_PIXELS=1048576
 
@@ -112,8 +117,7 @@ SEED=42
 CONTINUE_TRAINING=false
 
 python examples/z_image/model_training/train_layer_groups.py \
-  --dataset_base_path "$DATASET_PATH" \
-  --dataset_metadata_path "$DATASET_METADATA" \
+  $([ -n "$ZITPACK_DIR" ] && echo "--zitpacks \"$ZITPACK_DIR\"" || echo "--dataset_base_path \"$DATASET_PATH\" --dataset_metadata_path \"$DATASET_METADATA\"") \
   --dataset_repeat $DATASET_REPEAT \
   --max_pixels $MAX_PIXELS \
   --model_id_with_origin_paths "$MODEL_PATHS" \

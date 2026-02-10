@@ -35,6 +35,7 @@ from tqdm import tqdm
 from einops import rearrange
 from PIL import Image
 from collections import defaultdict
+from pathlib import Path
 from safetensors.torch import save_file, load_file
 
 # Add parent to path for imports
@@ -1776,8 +1777,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Z-Image Layer Group Training")
 
     # Dataset args
-    parser.add_argument("--dataset_base_path", type=str, required=True)
+    parser.add_argument("--dataset_base_path", type=str, default=None,
+                        help="Base path to dataset folder (required unless --zitpacks is used)")
     parser.add_argument("--dataset_metadata_path", type=str, default=None)
+    parser.add_argument("--zitpacks", type=str, default=None,
+                        help="Directory containing .zitpack archive files. "
+                             "When provided, --dataset_base_path and --dataset_metadata_path are ignored.")
     parser.add_argument("--dataset_repeat", type=int, default=1)
     parser.add_argument("--max_pixels", type=int, default=262144)
     parser.add_argument("--height", type=int, default=None)
@@ -1850,6 +1855,21 @@ def parse_args():
 
 import gc  # Already in your imports, but ensure it's used
 
+def _safe_rename_to_old(path: str):
+    """Rename a file to .old if it exists, for crash-safe saving."""
+    if os.path.exists(path):
+        old_path = path + ".old"
+        os.replace(path, old_path)
+
+
+def _safe_cleanup_old(paths: list):
+    """Remove .old backup files after successful save."""
+    for path in paths:
+        old_path = path + ".old"
+        if os.path.exists(old_path):
+            os.remove(old_path)
+
+
 def save_training_state(
     output_path: str,
     global_step: int,
@@ -1863,6 +1883,10 @@ def save_training_state(
     Optimizer state files are saved as a single set (overwritten each save) since keeping
     multiple copies serves little purpose and wastes disk space. Model checkpoints are
     saved with step numbers to preserve training history.
+
+    Uses crash-safe rotation: existing files are renamed to .old before writing new ones,
+    then .old files are deleted after all writes succeed. If a crash happens mid-save,
+    the .old files preserve the previous valid checkpoint.
     """
     # Ensure everything is offloaded to CPU
     model.offload_dit_layers()
@@ -1875,7 +1899,19 @@ def save_training_state(
     # Small dict for per-param steps (ints, negligible RAM)
     opt_steps = {k: optimizer.state[k]["step"] for k in optimizer.state}
 
-    # Save optimizer states in batches (one per layer group) - single overwriting set
+    # Collect all paths that will be overwritten for crash-safe rotation
+    overwrite_paths = []
+    for group_idx in range(num_groups):
+        overwrite_paths.append(os.path.join(output_path, f"optimizer_group_{group_idx}.safetensors"))
+    overwrite_paths.append(os.path.join(output_path, "optimizer_persistent.safetensors"))
+    overwrite_paths.append(os.path.join(output_path, "training_state_latest.pt"))
+
+    # Phase 1: Rename existing files to .old
+    for path in overwrite_paths:
+        _safe_rename_to_old(path)
+
+    # Phase 2: Write new files
+    # Save optimizer states in batches (one per layer group)
     for group_idx in range(num_groups):
         start_layer = group_idx * layers_per_group
         end_layer = min(start_layer + layers_per_group, num_layers)
@@ -1892,7 +1928,6 @@ def save_training_state(
                 flat_group[f"{k}_exp_avg"] = optimizer.state[k]["exp_avg"]
                 flat_group[f"{k}_exp_avg_sq"] = optimizer.state[k]["exp_avg_sq"]
 
-            # No step number - overwrites each save
             opt_group_path = os.path.join(output_path, f"optimizer_group_{group_idx}.safetensors")
             save_file(flat_group, opt_group_path)
             print(f"Saved optimizer group {group_idx} to {opt_group_path}")
@@ -1900,7 +1935,7 @@ def save_training_state(
             del flat_group  # Release the dict immediately
             gc.collect()  # Force garbage collection to free any overhead
 
-    # Save persistent params (small, separate file) - single overwriting file
+    # Save persistent params (small, separate file)
     persistent_keys = [k for k in optimizer.state if k.startswith("persistent.")]
     if persistent_keys:
         flat_persistent = {}
@@ -1908,15 +1943,14 @@ def save_training_state(
             flat_persistent[f"{k}_exp_avg"] = optimizer.state[k]["exp_avg"]
             flat_persistent[f"{k}_exp_avg_sq"] = optimizer.state[k]["exp_avg_sq"]
 
-        # No step number - overwrites each save
-        opt_pers_path = os.path.join(output_path, f"optimizer_persistent.safetensors")
+        opt_pers_path = os.path.join(output_path, "optimizer_persistent.safetensors")
         save_file(flat_persistent, opt_pers_path)
         print(f"Saved optimizer persistent to {opt_pers_path}")
 
         del flat_persistent
         gc.collect()
 
-    # Save small non-tensor state to .pt - single overwriting file
+    # Save small non-tensor state to .pt
     small_state = {
         "global_step": global_step,
         "epoch": epoch,
@@ -1930,12 +1964,14 @@ def save_training_state(
         "scheduler_state": lr_scheduler.state_dict(),
         "num_groups": num_groups,  # Store for loading
     }
-    # Save as training_state_latest.pt (overwrites)
     state_path = os.path.join(output_path, "training_state_latest.pt")
     torch.save(small_state, state_path)
     print(f"Saved training state metadata to {state_path}")
 
-    # Save model weights WITH step number (keep training history)
+    # Phase 3: All writes succeeded - remove .old backups
+    _safe_cleanup_old(overwrite_paths)
+
+    # Save model weights WITH step number (keep training history, no overwrite)
     model_state = {}
     for name, param in model.pipe.dit.named_parameters():
         model_state[name] = param.to("cpu")
@@ -1964,15 +2000,23 @@ def load_training_state(
     Returns:
         Tuple of (global_step, epoch)
     """
-    # Handle directory path - look for training_state_latest.pt
+    # Handle directory path - look for training_state_latest.pt (or .old from interrupted save)
     if os.path.isdir(checkpoint_path):
         state_file = os.path.join(checkpoint_path, "training_state_latest.pt")
-        if not os.path.exists(state_file):
+        state_file_old = state_file + ".old"
+        if os.path.exists(state_file):
+            checkpoint_path = state_file
+        elif os.path.exists(state_file_old):
+            print(f"Recovering from interrupted save: using {state_file_old}")
+            checkpoint_path = state_file_old
+        else:
             raise FileNotFoundError(
                 f"No training_state_latest.pt found in {checkpoint_path}. "
                 "Make sure the directory contains a valid checkpoint."
             )
-        checkpoint_path = state_file
+    elif not os.path.exists(checkpoint_path) and os.path.exists(checkpoint_path + ".old"):
+        print(f"Recovering from interrupted save: using {checkpoint_path}.old")
+        checkpoint_path = checkpoint_path + ".old"
 
     print(f"Loading training state from {checkpoint_path}...")
     checkpoint_dir = os.path.dirname(checkpoint_path)
@@ -1986,10 +2030,16 @@ def load_training_state(
     # Get num_groups from saved state (new format) or default to 6 (legacy)
     num_groups = small_state.get("num_groups", 6)
 
-    # Load layer group batches - try new format first, then legacy
+    # Load layer group batches - try new format, then .old recovery, then legacy
     for group_idx in range(num_groups):
         # New format: optimizer_group_N.safetensors (no step number)
         opt_group_path = os.path.join(checkpoint_dir, f"optimizer_group_{group_idx}.safetensors")
+
+        # Recovery: .old file from interrupted save
+        if not os.path.exists(opt_group_path):
+            old_path = opt_group_path + ".old"
+            if os.path.exists(old_path):
+                opt_group_path = old_path
 
         # Legacy format: optimizer_group_N_step_XXX.safetensors
         if not os.path.exists(opt_group_path):
@@ -2007,8 +2057,12 @@ def load_training_state(
                 opt_state[param_key]["exp_avg_sq"] = flat_group[f"{param_key}_exp_avg_sq"]
                 opt_state[param_key]["step"] = small_state["optimizer"]["steps"][param_key]
 
-    # Load persistent - try new format first, then legacy
+    # Load persistent - try new format, then .old recovery, then legacy
     opt_pers_path = os.path.join(checkpoint_dir, "optimizer_persistent.safetensors")
+    if not os.path.exists(opt_pers_path):
+        old_path = opt_pers_path + ".old"
+        if os.path.exists(old_path):
+            opt_pers_path = old_path
     if not os.path.exists(opt_pers_path):
         legacy_path = os.path.join(checkpoint_dir, f"optimizer_persistent_step_{global_step}.safetensors")
         if os.path.exists(legacy_path):
@@ -2058,6 +2112,11 @@ def load_image_from_data(image_data, base_path: str):
 def main():
     args = parse_args()
 
+    # Validate dataset source: need either --zitpacks or --dataset_base_path
+    if not args.zitpacks and not args.dataset_base_path:
+        print("Error: Either --zitpacks or --dataset_base_path must be provided.")
+        sys.exit(1)
+
     # Set custom model base path if provided
     if args.model_base_path is not None:
         os.environ['DIFFSYNTH_MODEL_BASE_PATH'] = args.model_base_path
@@ -2105,19 +2164,38 @@ def main():
     print("=" * 60)
 
     # Create dataset
-    dataset = UnifiedDataset(
-        base_path=args.dataset_base_path,
-        metadata_path=args.dataset_metadata_path,
-        repeat=args.dataset_repeat,
-        main_data_operator=UnifiedDataset.default_image_operator(
+    if args.zitpacks:
+        # Load dataset from .zitpack archives
+        zitpack_dir = Path(args.zitpacks)
+        zitpack_files = sorted(zitpack_dir.glob("*.zitpack"))
+        if not zitpack_files:
+            print(f"Error: No .zitpack files found in {zitpack_dir}")
+            sys.exit(1)
+
+        # Add python-scripts/ to path for dataset_archive import
+        scripts_dir = Path(__file__).resolve().parent.parent.parent.parent.parent / "python-scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        from dataset_archive import ZitpackDataset
+
+        dataset = ZitpackDataset(zitpack_files, repeat=args.dataset_repeat)
+        print(f"Loaded {dataset.archive_count} zitpack archive(s) with {dataset.total_entries} entries")
+        for f in zitpack_files:
+            print(f"  - {f}")
+    else:
+        dataset = UnifiedDataset(
             base_path=args.dataset_base_path,
-            max_pixels=args.max_pixels,
-            height=args.height,
-            width=args.width,
-            height_division_factor=16,
-            width_division_factor=16,
+            metadata_path=args.dataset_metadata_path,
+            repeat=args.dataset_repeat,
+            main_data_operator=UnifiedDataset.default_image_operator(
+                base_path=args.dataset_base_path,
+                max_pixels=args.max_pixels,
+                height=args.height,
+                width=args.width,
+                height_division_factor=16,
+                width_division_factor=16,
+            )
         )
-    )
 
     print(f"Dataset size: {len(dataset)} samples")
 
@@ -2262,7 +2340,7 @@ def main():
                 try:
                     image = load_image_from_data(
                         sample["image"][0] if isinstance(sample["image"], list) else sample["image"],
-                        args.dataset_base_path
+                        args.dataset_base_path or ""
                     )
                     prompt = sample["prompt"][0] if isinstance(sample["prompt"], list) else sample["prompt"]
                     batch.append({"image": image, "prompt": prompt})

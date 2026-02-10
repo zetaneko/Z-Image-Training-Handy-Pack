@@ -53,6 +53,7 @@ from .format import (
 
 from .reader import DatasetArchive, ArchiveEntry, SearchResult
 from .writer import DatasetArchiveWriter
+from .torch_dataset import ZitpackDataset
 
 
 __all__ = [
@@ -80,6 +81,7 @@ __all__ = [
     'ArchiveEntry',
     'SearchResult',
     'DatasetArchiveWriter',
+    'ZitpackDataset',
 ]
 
 __version__ = f"{VERSION_MAJOR}.{VERSION_MINOR}"
