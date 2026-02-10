@@ -5,8 +5,11 @@ Browse, search, edit, and batch-modify image captions at scale.
 Handles datasets of 30,000+ images with efficient lazy loading.
 """
 
+import glob
+import io
 import os
 import re
+import sys
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -20,6 +23,9 @@ except ImportError:
     Image = None
     ImageTk = None
 
+# Add script directory to path for dataset_archive imports
+sys.path.insert(0, str(Path(__file__).parent))
+
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tiff'}
 
 
@@ -28,9 +34,12 @@ class ImageEntry:
     image_path: Path
     caption_path: Optional[Path]
     caption_text: str
-    caption_type: str  # 'autocaption' | 'original' | 'none'
+    caption_type: str  # 'autocaption' | 'original' | 'none' | 'archive'
     relative_path: str
     item_id: str = ''
+    # Archive-specific fields
+    archive_path: Optional[Path] = None
+    archive_index: int = -1
 
 
 def parse_search_query(query: str):
@@ -108,16 +117,29 @@ class CaptionInspectorTab(ttk.Frame):
         self.load_settings()
 
     def _build_ui(self):
-        # === Top bar: folder selection ===
+        # === Mode selector ===
+        mode_frame = ttk.Frame(self)
+        mode_frame.pack(fill='x', pady=(0, 5))
+
+        ttk.Label(mode_frame, text="Source:").pack(side='left', padx=(0, 5))
+        self.mode_var = tk.StringVar(value="disk")
+        ttk.Radiobutton(mode_frame, text="Disk (folders)", variable=self.mode_var,
+                        value="disk", command=self._on_mode_change).pack(side='left', padx=(0, 10))
+        ttk.Radiobutton(mode_frame, text="Packed Archive (.zitpack)", variable=self.mode_var,
+                        value="archive", command=self._on_mode_change).pack(side='left')
+
+        # === Top bar: folder/archive selection ===
         top_frame = ttk.Frame(self)
         top_frame.pack(fill='x', pady=(0, 5))
 
-        ttk.Label(top_frame, text="Folder:").pack(side='left', padx=(0, 5))
+        self.source_label = ttk.Label(top_frame, text="Folder:")
+        self.source_label.pack(side='left', padx=(0, 5))
         self.folder_var = tk.StringVar()
         self.folder_entry = ttk.Entry(top_frame, textvariable=self.folder_var)
         self.folder_entry.pack(side='left', fill='x', expand=True, padx=(0, 5))
-        ttk.Button(top_frame, text="Browse...", command=self._browse_folder, width=10).pack(side='left', padx=(0, 5))
-        self.load_btn = ttk.Button(top_frame, text="Load", command=self._load_folder, width=8)
+        self.browse_btn = ttk.Button(top_frame, text="Browse...", command=self._browse_source, width=10)
+        self.browse_btn.pack(side='left', padx=(0, 5))
+        self.load_btn = ttk.Button(top_frame, text="Load", command=self._load_source, width=8)
         self.load_btn.pack(side='left', padx=(0, 5))
         self.stop_load_btn = ttk.Button(top_frame, text="Stop", command=self._stop_loading, width=8, state='disabled')
         self.stop_load_btn.pack(side='left')
@@ -266,13 +288,34 @@ class CaptionInspectorTab(ttk.Frame):
         self.context_menu.add_command(label="Delete", command=self._delete_selected)
         self.tree.bind('<Button-3>', self._show_context_menu)
 
-    # ── Directory Loading ──────────────────────────────────────────
+    # ── Mode Switching ──────────────────────────────────────────────
 
-    def _browse_folder(self):
+    def _on_mode_change(self):
+        mode = self.mode_var.get()
+        if mode == 'disk':
+            self.source_label.config(text="Folder:")
+        else:
+            self.source_label.config(text="Archive:")
+
+    def _browse_source(self):
         from tkinter import filedialog
-        path = filedialog.askdirectory()
+        if self.mode_var.get() == 'disk':
+            path = filedialog.askdirectory()
+        else:
+            path = filedialog.askopenfilename(
+                filetypes=[("Zitpack archives", "*.zitpack"), ("All files", "*.*")],
+                title="Select a .zitpack archive"
+            )
         if path:
             self.folder_var.set(path)
+
+    def _load_source(self):
+        if self.mode_var.get() == 'disk':
+            self._load_folder()
+        else:
+            self._load_archive()
+
+    # ── Directory Loading ──────────────────────────────────────────
 
     def _load_folder(self):
         folder = self.folder_var.get().strip()
@@ -290,7 +333,105 @@ class CaptionInspectorTab(ttk.Frame):
         self.load_btn.config(state='disabled')
         self.stop_load_btn.config(state='normal')
 
-        # Clear existing data
+        self._clear_all_data()
+        self.status_var.set("Scanning...")
+
+        thread = threading.Thread(target=self._scan_directory, args=(folder_path,), daemon=True)
+        thread.start()
+
+    # ── Archive Loading ───────────────────────────────────────────
+
+    def _load_archive(self):
+        archive_input = self.folder_var.get().strip()
+        if not archive_input:
+            messagebox.showwarning("No Archive", "Please select an archive file first.")
+            return
+
+        archive_path = Path(archive_input)
+        if not archive_path.exists():
+            messagebox.showerror("Not Found", f"'{archive_input}' does not exist.")
+            return
+
+        # Find all matching chunk files (e.g., dataset_chunk_000.zitpack, _001, ...)
+        if '_chunk_' in archive_path.stem:
+            # Extract base pattern and find all chunks
+            base = archive_path.name.rsplit('_chunk_', 1)[0]
+            pattern = str(archive_path.parent / f"{base}_chunk_*.zitpack")
+            archive_paths = sorted(Path(p) for p in glob.glob(pattern))
+        else:
+            archive_paths = [archive_path]
+
+        if not archive_paths:
+            messagebox.showerror("No Archives", "No archive files found.")
+            return
+
+        self.root_folder = archive_path.parent
+        self.is_loading = True
+        self.cancel_loading = False
+        self.load_btn.config(state='disabled')
+        self.stop_load_btn.config(state='normal')
+
+        self._clear_all_data()
+        self.status_var.set("Loading archives...")
+
+        thread = threading.Thread(target=self._scan_archives, args=(archive_paths,), daemon=True)
+        thread.start()
+
+    def _scan_archives(self, archive_paths: list):
+        """Scan zitpack archives for entries. Runs in background thread."""
+        try:
+            from dataset_archive import DatasetArchive
+        except ImportError:
+            self.after(0, lambda: messagebox.showerror(
+                "Import Error", "dataset_archive module not found."))
+            self.after(0, self._loading_finished, 0)
+            return
+
+        batch = []
+        count = 0
+
+        for archive_path in archive_paths:
+            if self.cancel_loading:
+                break
+            try:
+                archive = DatasetArchive(archive_path)
+                num_entries = len(archive)
+
+                for idx in range(num_entries):
+                    if self.cancel_loading:
+                        break
+
+                    info = archive.get_entry_info(idx)
+                    caption = archive.get_caption(idx)
+
+                    entry = ImageEntry(
+                        image_path=Path(info.filename),
+                        caption_path=None,
+                        caption_text=caption,
+                        caption_type='archive',
+                        relative_path=archive_path.name,
+                        archive_path=archive_path,
+                        archive_index=idx,
+                    )
+                    batch.append(entry)
+                    count += 1
+
+                    if len(batch) >= 500:
+                        self._insert_batch(batch.copy(), count)
+                        batch.clear()
+
+                archive.close()
+            except Exception as e:
+                self.after(0, lambda msg=str(e), name=archive_path.name:
+                    messagebox.showwarning("Archive Warning", f"Error reading {name}: {msg}"))
+
+        if batch and not self.cancel_loading:
+            self._insert_batch(batch.copy(), count)
+
+        self.after(0, self._loading_finished, count)
+
+    def _clear_all_data(self):
+        """Clear all loaded data from the treeview and internal state."""
         self.tree.delete(*self.tree.get_children())
         for iid in self.detached_ids:
             try:
@@ -301,10 +442,6 @@ class CaptionInspectorTab(ttk.Frame):
         self.all_item_ids.clear()
         self.detached_ids.clear()
         self._clear_preview()
-        self.status_var.set("Scanning...")
-
-        thread = threading.Thread(target=self._scan_directory, args=(folder_path,), daemon=True)
-        thread.start()
 
     def _stop_loading(self):
         self.cancel_loading = True
@@ -360,7 +497,7 @@ class CaptionInspectorTab(ttk.Frame):
     def _do_insert_batch(self, batch: List[ImageEntry], total_so_far: int):
         for entry in batch:
             caption_snippet = entry.caption_text[:100].replace('\n', ' ') if entry.caption_text else '(no caption)'
-            type_label = {'autocaption': 'auto', 'original': 'txt', 'none': '-'}[entry.caption_type]
+            type_label = {'autocaption': 'auto', 'original': 'txt', 'none': '-', 'archive': 'pack'}[entry.caption_type]
             iid = self.tree.insert('', 'end', values=(
                 entry.image_path.name,
                 entry.relative_path,
@@ -418,24 +555,31 @@ class CaptionInspectorTab(ttk.Frame):
             return
 
         self.multi_label.config(text="")
-        self.save_btn.config(state='normal')
-        self.revert_btn.config(state='normal')
         self.caption_text.config(state='normal')
 
         # Update caption editor
         self.caption_text.delete('1.0', 'end')
         self.caption_text.insert('1.0', entry.caption_text)
 
-        if entry.caption_type == 'autocaption':
-            self.caption_source_var.set(f"Source: .autocaption.txt")
-        elif entry.caption_type == 'original':
-            self.caption_source_var.set(f"Source: .txt")
+        if entry.caption_type == 'archive':
+            self.caption_source_var.set(f"Source: {entry.relative_path} (packed archive, read-only)")
+            self.save_btn.config(state='disabled')
+            self.revert_btn.config(state='disabled')
+            # Load image from archive
+            self._pending_preview_path = None
+            self._load_preview_from_archive(entry)
         else:
-            self.caption_source_var.set("No caption file (will create .autocaption.txt on save)")
-
-        # Load image preview
-        self._pending_preview_path = entry.image_path
-        self._load_preview_image(entry.image_path)
+            self.save_btn.config(state='normal')
+            self.revert_btn.config(state='normal')
+            if entry.caption_type == 'autocaption':
+                self.caption_source_var.set(f"Source: .autocaption.txt")
+            elif entry.caption_type == 'original':
+                self.caption_source_var.set(f"Source: .txt")
+            else:
+                self.caption_source_var.set("No caption file (will create .autocaption.txt on save)")
+            # Load image from disk
+            self._pending_preview_path = entry.image_path
+            self._load_preview_image(entry.image_path)
 
     def _load_preview_image(self, image_path: Path):
         if Image is None:
@@ -450,6 +594,34 @@ class CaptionInspectorTab(ttk.Frame):
         try:
             img = Image.open(image_path)
             img.load()  # force load to catch errors early
+        except Exception as e:
+            self.preview_canvas.delete('all')
+            self.preview_canvas.create_text(
+                self.preview_canvas.winfo_width() // 2,
+                self.preview_canvas.winfo_height() // 2,
+                text=f"Cannot load image:\n{e}", fill='white', justify='center'
+            )
+            return
+
+        self._fit_image_to_canvas(img)
+
+    def _load_preview_from_archive(self, entry: ImageEntry):
+        """Load image preview from a zitpack archive entry."""
+        if Image is None:
+            self.preview_canvas.delete('all')
+            self.preview_canvas.create_text(
+                self.preview_canvas.winfo_width() // 2,
+                self.preview_canvas.winfo_height() // 2,
+                text="PIL/Pillow not installed", fill='white'
+            )
+            return
+
+        try:
+            from dataset_archive import DatasetArchive
+            with DatasetArchive(entry.archive_path) as archive:
+                image_bytes = archive.get_image(entry.archive_index)
+            img = Image.open(io.BytesIO(image_bytes))
+            img.load()
         except Exception as e:
             self.preview_canvas.delete('all')
             self.preview_canvas.create_text(
@@ -531,6 +703,10 @@ class CaptionInspectorTab(ttk.Frame):
         if not entry:
             return
 
+        if entry.caption_type == 'archive':
+            messagebox.showinfo("Read Only", "Packed archive entries are read-only.")
+            return
+
         new_text = self.caption_text.get('1.0', 'end').strip()
 
         # Determine save path
@@ -554,7 +730,7 @@ class CaptionInspectorTab(ttk.Frame):
 
         # Update treeview
         snippet = new_text[:100].replace('\n', ' ') if new_text else '(no caption)'
-        type_label = {'autocaption': 'auto', 'original': 'txt', 'none': '-'}[entry.caption_type]
+        type_label = {'autocaption': 'auto', 'original': 'txt', 'none': '-', 'archive': 'pack'}[entry.caption_type]
         self.tree.item(selection[0], values=(
             entry.image_path.name, entry.relative_path, type_label, snippet
         ))
@@ -666,7 +842,7 @@ class CaptionInspectorTab(ttk.Frame):
                 if entry.caption_type == 'none':
                     entry.caption_type = 'autocaption'
                 snippet = new_text[:100].replace('\n', ' ') if new_text else '(no caption)'
-                type_label = {'autocaption': 'auto', 'original': 'txt', 'none': '-'}[entry.caption_type]
+                type_label = {'autocaption': 'auto', 'original': 'txt', 'none': '-', 'archive': 'pack'}[entry.caption_type]
                 self.tree.item(iid, values=(entry.image_path.name, entry.relative_path, type_label, snippet))
             except Exception:
                 errors += 1
@@ -714,7 +890,7 @@ class CaptionInspectorTab(ttk.Frame):
                 if entry.caption_type == 'none':
                     entry.caption_type = 'autocaption'
                 snippet = new_text[:100].replace('\n', ' ') if new_text else '(no caption)'
-                type_label = {'autocaption': 'auto', 'original': 'txt', 'none': '-'}[entry.caption_type]
+                type_label = {'autocaption': 'auto', 'original': 'txt', 'none': '-', 'archive': 'pack'}[entry.caption_type]
                 self.tree.item(iid, values=(entry.image_path.name, entry.relative_path, type_label, snippet))
             except Exception:
                 errors += 1
@@ -734,6 +910,16 @@ class CaptionInspectorTab(ttk.Frame):
         selection = self.tree.selection()
         if not selection:
             messagebox.showinfo("Nothing Selected", "Please select images to delete.")
+            return
+
+        # Check for archive entries
+        has_archive = any(
+            self.entries.get(iid) and self.entries[iid].caption_type == 'archive'
+            for iid in selection
+        )
+        if has_archive:
+            messagebox.showinfo("Read Only", "Cannot delete entries from packed archives.\n"
+                               "Archive entries are read-only.")
             return
 
         # Count files that will be deleted
@@ -839,20 +1025,27 @@ class CaptionInspectorTab(ttk.Frame):
             return
 
         import subprocess
-        import sys
-        folder = str(entry.image_path.parent)
-        if sys.platform == 'win32':
-            subprocess.Popen(['explorer', '/select,', str(entry.image_path)])
-        elif sys.platform == 'darwin':
-            subprocess.Popen(['open', '-R', str(entry.image_path)])
+        if entry.caption_type == 'archive' and entry.archive_path:
+            # For archive entries, open the archive's folder
+            target = str(entry.archive_path.parent)
+            file_target = str(entry.archive_path)
         else:
-            subprocess.Popen(['xdg-open', folder])
+            target = str(entry.image_path.parent)
+            file_target = str(entry.image_path)
+
+        if sys.platform == 'win32':
+            subprocess.Popen(['explorer', '/select,', file_target])
+        elif sys.platform == 'darwin':
+            subprocess.Popen(['open', '-R', file_target])
+        else:
+            subprocess.Popen(['xdg-open', target])
 
     # ── Settings ───────────────────────────────────────────────────
 
     def save_settings(self):
         settings = {
             'folder': self.folder_var.get(),
+            'mode': self.mode_var.get(),
         }
         self.settings_manager.set_tab_settings(self.tab_name, settings)
 
@@ -860,10 +1053,16 @@ class CaptionInspectorTab(ttk.Frame):
         settings = self.settings_manager.get_tab_settings(self.tab_name)
         if settings:
             self.folder_var.set(settings.get('folder', ''))
+            mode = settings.get('mode', 'disk')
+            self.mode_var.set(mode)
+            self._on_mode_change()
 
     def get_settings(self):
-        return {'folder': self.folder_var.get()}
+        return {'folder': self.folder_var.get(), 'mode': self.mode_var.get()}
 
     def set_settings(self, settings):
         if 'folder' in settings:
             self.folder_var.set(settings['folder'])
+        if 'mode' in settings:
+            self.mode_var.set(settings['mode'])
+            self._on_mode_change()

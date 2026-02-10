@@ -1338,6 +1338,140 @@ class LayerGroupTrainingTab(ttk.Frame):
             self.set_settings(settings)
 
 
+class PackDatasetTab(ttk.Frame):
+    """Tab for pack_dataset.py script - pack images+captions into zitpack archives."""
+
+    def __init__(self, parent, script_dir: Path, output_widget: scrolledtext.ScrolledText, settings_manager: SettingsManager):
+        super().__init__(parent, padding=10)
+        self.script_path = script_dir / 'pack_dataset.py'
+        self.output_widget = output_widget
+        self.settings_manager = settings_manager
+        self.tab_name = 'pack_dataset'
+
+        # Description
+        desc = ttk.Label(self, text="Pack images and captions into chunked zitpack archives for training.\n"
+                                    "Combines multiple caption files (all.txt, .score.txt, .autocaption.txt, .quality.txt)\n"
+                                    "into a single caption per image. Supports incremental updates.",
+                        wraplength=600, justify='left')
+        desc.pack(anchor='w', pady=(0, 15))
+
+        # Input folder
+        self.input_path = PathSelector(self, "Input Folder:", mode='folder')
+        self.input_path.pack(fill='x', pady=5)
+
+        # Output base path
+        self.output_path = PathSelector(self, "Output Base Path:", mode='folder')
+        self.output_path.pack(fill='x', pady=5)
+        ttk.Label(self, text="(e.g., ./archives/dataset -> creates dataset_chunk_000.zitpack, ...)").pack(anchor='e', padx=(0, 80))
+
+        # Chunk size
+        chunk_frame = ttk.Frame(self)
+        chunk_frame.pack(fill='x', pady=5)
+        ttk.Label(chunk_frame, text="Chunk Size (MB):", width=20, anchor='e').pack(side='left', padx=(0, 5))
+        self.chunk_size_var = tk.IntVar(value=512)
+        ttk.Spinbox(chunk_frame, from_=1, to=2048, increment=64, textvariable=self.chunk_size_var, width=10).pack(side='left')
+
+        # Caption suffixes
+        suffix_frame = ttk.LabelFrame(self, text="Caption Concatenation Order", padding=10)
+        suffix_frame.pack(fill='x', pady=5)
+
+        ttk.Label(suffix_frame, text="all.txt in each folder is always included first (if present).",
+                 font=('TkDefaultFont', 8), foreground='gray').pack(anchor='w')
+
+        suffixes_row = ttk.Frame(suffix_frame)
+        suffixes_row.pack(fill='x', pady=(5, 0))
+        ttk.Label(suffixes_row, text="Caption Suffixes:", width=20, anchor='e').pack(side='left', padx=(0, 5))
+        self.suffixes_var = tk.StringVar(value=".score.txt, .autocaption.txt, .quality.txt")
+        ttk.Entry(suffixes_row, textvariable=self.suffixes_var, width=50).pack(side='left', fill='x', expand=True)
+
+        ttk.Label(suffix_frame, text="Comma-separated, in order. .autocaption.txt falls back to .txt if not found.",
+                 font=('TkDefaultFont', 8), foreground='gray').pack(anchor='w', pady=(2, 0))
+
+        # Options
+        options_frame = ttk.Frame(self)
+        options_frame.pack(fill='x', pady=10)
+        ttk.Label(options_frame, text="Options:", width=20, anchor='e').pack(side='left', padx=(0, 5))
+        self.update_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(options_frame, text="Update mode (only pack new files)", variable=self.update_var).pack(side='left')
+        self.no_checksums_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(options_frame, text="Disable checksums", variable=self.no_checksums_var).pack(side='left', padx=(20, 0))
+
+        # Buttons frame
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(pady=15)
+
+        self.run_btn = ttk.Button(btn_frame, text="Pack Dataset", command=self._run, width=15)
+        self.run_btn.pack(side='left', padx=5)
+
+        self.stop_btn = ttk.Button(btn_frame, text="Stop", command=self._stop, state='disabled', width=10)
+        self.stop_btn.pack(side='left', padx=5)
+
+        self.runner = ScriptRunner(output_widget, self.run_btn, self.stop_btn)
+
+        # Load saved settings
+        self.load_settings()
+
+    def _stop(self):
+        self.runner.stop()
+
+    def _run(self):
+        input_path = self.input_path.get()
+        output_path = self.output_path.get()
+
+        if not input_path:
+            self.runner.clear_output()
+            self.runner.append_output("Error: Please select an input folder\n")
+            return
+        if not output_path:
+            self.runner.clear_output()
+            self.runner.append_output("Error: Please specify an output base path\n")
+            return
+
+        cmd = [sys.executable, str(self.script_path),
+               '--input', input_path,
+               '--output', output_path,
+               '--chunk-size', str(self.chunk_size_var.get())]
+
+        # Caption suffixes
+        suffixes = self.suffixes_var.get().strip()
+        if suffixes:
+            cmd.extend(['--caption-suffixes', suffixes])
+
+        if self.update_var.get():
+            cmd.append('--update')
+        if self.no_checksums_var.get():
+            cmd.append('--no-checksums')
+
+        self.save_settings()
+        self.runner.run(cmd)
+
+    def get_settings(self) -> Dict[str, Any]:
+        return {
+            'input_path': self.input_path.get(),
+            'output_path': self.output_path.get(),
+            'chunk_size': self.chunk_size_var.get(),
+            'suffixes': self.suffixes_var.get(),
+            'update_mode': self.update_var.get(),
+            'no_checksums': self.no_checksums_var.get(),
+        }
+
+    def set_settings(self, settings: Dict[str, Any]):
+        self.input_path.set(settings.get('input_path', ''))
+        self.output_path.set(settings.get('output_path', ''))
+        self.chunk_size_var.set(settings.get('chunk_size', 512))
+        self.suffixes_var.set(settings.get('suffixes', '.score.txt, .autocaption.txt, .quality.txt'))
+        self.update_var.set(settings.get('update_mode', False))
+        self.no_checksums_var.set(settings.get('no_checksums', False))
+
+    def save_settings(self):
+        self.settings_manager.set_tab_settings(self.tab_name, self.get_settings())
+
+    def load_settings(self):
+        settings = self.settings_manager.get_tab_settings(self.tab_name)
+        if settings:
+            self.set_settings(settings)
+
+
 class App(tk.Tk):
     """Main application window."""
 
@@ -1383,6 +1517,8 @@ class App(tk.Tk):
                          text="Replace Booru Tags")
         self.notebook.add(GenerateMetadataTab(self.notebook, self.script_dir, self.output_text, self.settings_manager),
                          text="Generate Metadata")
+        self.notebook.add(PackDatasetTab(self.notebook, self.script_dir, self.output_text, self.settings_manager),
+                         text="Pack Dataset")
         self.notebook.add(AutoCaptionTab(self.notebook, self.script_dir, self.output_text, self.settings_manager),
                          text="Auto Caption")
         self.notebook.add(QualityCaptionTab(self.notebook, self.script_dir, self.output_text, self.settings_manager),

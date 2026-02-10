@@ -5,9 +5,19 @@ Pack a folder of images+captions into chunked zitpack archives.
 Creates memory-efficient archives for training datasets. Each archive chunk
 is ~512MB and self-contained with its own index.
 
+Captions are built by concatenating multiple caption files per image into a
+single combined caption (joined with ", "). The order is:
+  1. all.txt (shared file in the same folder as the image, if present)
+  2. Per-image caption files by suffix, e.g.: .score.txt, .autocaption.txt, .quality.txt
+
+For .autocaption.txt specifically: if the file doesn't exist, the original
+.txt caption is used as a fallback. The .txt caption is never used when
+.autocaption.txt exists.
+
 Usage:
   python pack_dataset.py --input ./images --output ./packed/dataset
   python pack_dataset.py --input ./images --output ./packed/dataset --chunk-size 256
+  python pack_dataset.py --input ./images --output ./packed/dataset --caption-suffixes ".score.txt,.autocaption.txt,.quality.txt"
 
 Incremental Update:
   python pack_dataset.py --input ./images --output ./packed/dataset --update
@@ -31,6 +41,9 @@ from dataset_archive import DatasetArchive, DatasetArchiveWriter, TARGET_CHUNK_S
 
 # Image extensions to look for
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tiff'}
+
+# Default caption suffixes to concatenate (in order)
+DEFAULT_CAPTION_SUFFIXES = ['.score.txt', '.autocaption.txt', '.quality.txt']
 
 
 def print_progress(current: int, total: int, prefix: str = "Processing"):
@@ -56,6 +69,69 @@ def collect_image_files(input_dir: Path) -> list[Path]:
         if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS:
             image_files.append(p)
     return image_files
+
+
+def validate_image(image_path: Path) -> bool:
+    """Verify an image can be fully decoded by PIL. Returns True if valid."""
+    try:
+        from PIL import Image
+        with Image.open(image_path) as img:
+            img.load()  # force full decode to catch truncated/corrupt data
+        return True
+    except Exception:
+        return False
+
+
+def build_combined_caption(image_path: Path, caption_suffixes: list[str]) -> str:
+    """
+    Build a combined caption from multiple caption files.
+
+    Order:
+      1. all.txt in the same folder (shared across all images in that folder)
+      2. Per-image files in suffix order (e.g. .score.txt, .autocaption.txt, .quality.txt)
+
+    For .autocaption.txt: falls back to .txt if autocaption doesn't exist.
+    The .txt caption is never used when .autocaption.txt exists.
+
+    Returns:
+        Combined caption string, parts joined with ", "
+    """
+    parts = []
+
+    # 1. Check for all.txt in the same folder
+    all_txt = image_path.parent / 'all.txt'
+    if all_txt.exists():
+        text = all_txt.read_text(encoding='utf-8').strip()
+        if text:
+            parts.append(text)
+
+    # 2. Per-image caption files in suffix order
+    stem = image_path.stem
+    folder = image_path.parent
+
+    for suffix in caption_suffixes:
+        caption_file = folder / (stem + suffix)
+
+        if suffix == '.autocaption.txt':
+            # Special handling: use .autocaption.txt if exists, else fall back to .txt
+            if caption_file.exists():
+                text = caption_file.read_text(encoding='utf-8').strip()
+                if text:
+                    parts.append(text)
+            else:
+                # Fallback to original .txt
+                fallback = image_path.with_suffix('.txt')
+                if fallback.exists():
+                    text = fallback.read_text(encoding='utf-8').strip()
+                    if text:
+                        parts.append(text)
+        else:
+            if caption_file.exists():
+                text = caption_file.read_text(encoding='utf-8').strip()
+                if text:
+                    parts.append(text)
+
+    return ', '.join(parts)
 
 
 def find_existing_archives(output_base: Path) -> list[Path]:
@@ -97,6 +173,7 @@ def pack_dataset(
     chunk_size_mb: int = 512,
     compute_checksums: bool = True,
     update_mode: bool = False,
+    caption_suffixes: list[str] | None = None,
 ) -> list[Path]:
     """
     Pack a dataset folder into chunked zitpack archives.
@@ -107,10 +184,14 @@ def pack_dataset(
         chunk_size_mb: Target chunk size in MB
         compute_checksums: Whether to compute CRC32 checksums
         update_mode: If True, only pack new files not in existing archives
+        caption_suffixes: Ordered list of caption file suffixes to concatenate.
+                         None uses DEFAULT_CAPTION_SUFFIXES.
 
     Returns:
         List of created/modified archive paths
     """
+    if caption_suffixes is None:
+        caption_suffixes = DEFAULT_CAPTION_SUFFIXES
     # Collect all image files
     print(f"Scanning {input_dir}...")
     all_image_files = collect_image_files(input_dir)
@@ -154,6 +235,29 @@ def pack_dataset(
         image_files = all_image_files
         print(f"Found {len(image_files)} images")
 
+    # Validate images through PIL to skip corrupted files
+    print("Validating images...")
+    valid_files = []
+    skipped = 0
+    for i, image_path in enumerate(image_files):
+        print_progress(i + 1, len(image_files), "Validating")
+        if validate_image(image_path):
+            valid_files.append(image_path)
+        else:
+            skipped += 1
+            print(f"\n  Skipping corrupt image: {image_path.name}")
+
+    if sys.stdout.isatty():
+        print()
+
+    if skipped:
+        print(f"Skipped {skipped} corrupt image(s)")
+
+    image_files = valid_files
+    if not image_files:
+        print("No valid images to pack.")
+        return existing_archives if update_mode else []
+
     total_images = len(image_files)
 
     # Calculate target chunk size in bytes
@@ -163,9 +267,20 @@ def pack_dataset(
     total_size = 0
     for image_path in image_files:
         total_size += image_path.stat().st_size
-        caption_path = image_path.with_suffix('.txt')
-        if caption_path.exists():
-            total_size += caption_path.stat().st_size
+        # Estimate caption size from all potential caption files
+        stem = image_path.stem
+        folder = image_path.parent
+        all_txt = folder / 'all.txt'
+        if all_txt.exists():
+            total_size += all_txt.stat().st_size
+        for suffix in caption_suffixes:
+            cap_file = folder / (stem + suffix)
+            if cap_file.exists():
+                total_size += cap_file.stat().st_size
+            elif suffix == '.autocaption.txt':
+                fallback = image_path.with_suffix('.txt')
+                if fallback.exists():
+                    total_size += fallback.stat().st_size
 
     # Account for last chunk remaining space
     remaining_in_last = 0
@@ -227,9 +342,9 @@ def pack_dataset(
                 compute_checksums=compute_checksums,
             )
 
-        # Add entry
-        caption_path = image_path.with_suffix('.txt')
-        current_writer.add_entry(image_path, caption_path if caption_path.exists() else None)
+        # Build combined caption from multiple sources
+        combined_caption = build_combined_caption(image_path, caption_suffixes)
+        current_writer.add_entry(image_path, caption=combined_caption)
         file_index += 1
 
         # Check if chunk should be finalized
@@ -325,8 +440,17 @@ Output:
                         help='Disable CRC32 checksum computation')
     parser.add_argument('--update', '-u', action='store_true',
                         help='Incremental update: only pack new files not in existing archives')
+    parser.add_argument('--caption-suffixes', '-s', type=str,
+                        default=','.join(DEFAULT_CAPTION_SUFFIXES),
+                        help='Comma-separated caption file suffixes in order '
+                             '(default: %(default)s). '
+                             'all.txt in each folder is always included first. '
+                             '.autocaption.txt falls back to .txt if not found.')
 
     args = parser.parse_args()
+
+    # Parse caption suffixes
+    caption_suffixes = [s.strip() for s in args.caption_suffixes.split(',') if s.strip()]
 
     # Validate input
     if not args.input.exists():
@@ -343,11 +467,13 @@ Output:
     if args.chunk_size > 2048:
         print("Warning: Large chunk sizes may affect performance")
 
-    print(f"Input folder : {args.input}")
-    print(f"Output base  : {args.output}")
-    print(f"Chunk size   : {args.chunk_size} MB")
-    print(f"Checksums    : {'disabled' if args.no_checksums else 'enabled'}")
-    print(f"Update mode  : {'enabled' if args.update else 'disabled'}")
+    print(f"Input folder    : {args.input}")
+    print(f"Output base     : {args.output}")
+    print(f"Chunk size      : {args.chunk_size} MB")
+    print(f"Checksums       : {'disabled' if args.no_checksums else 'enabled'}")
+    print(f"Update mode     : {'enabled' if args.update else 'disabled'}")
+    print(f"Caption suffixes: {', '.join(caption_suffixes)}")
+    print(f"  (all.txt in each folder is always included first)")
     print()
 
     result = pack_dataset(
@@ -356,6 +482,7 @@ Output:
         chunk_size_mb=args.chunk_size,
         compute_checksums=not args.no_checksums,
         update_mode=args.update,
+        caption_suffixes=caption_suffixes,
     )
 
     if result:
