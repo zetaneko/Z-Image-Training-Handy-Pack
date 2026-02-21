@@ -2162,9 +2162,13 @@ def main():
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    if world_size > 1:
-        dist.init_process_group(backend="nccl")
     computation_device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+    if world_size > 1:
+        # Set the device before init so NCCL knows which GPU this rank owns.
+        # Without this, PyTorch warns about unknown device-to-rank mapping.
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", device_id=torch.device(computation_device))
     is_main = (rank == 0)
 
     # Validate dataset source: need either --zitpacks or --dataset_base_path

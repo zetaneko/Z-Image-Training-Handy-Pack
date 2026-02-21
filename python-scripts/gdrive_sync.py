@@ -160,6 +160,21 @@ def sync_via_service_account(
     print(f"Sync complete — downloaded {len(to_download)} file(s).")
 
 
+def _strip_shell_quotes(s: Optional[str]) -> Optional[str]:
+    """Remove a single layer of surrounding shell quotes if present.
+
+    Shell scripts that build arguments with $(echo "--flag \"$VAR\"") pass literal
+    quote characters to Python (bash does not strip quotes from command-substitution
+    output). This helper undoes that so callers receive the bare value.
+    """
+    if s is None:
+        return None
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        s = s[1:-1]
+    return s
+
+
 def sync_zitpacks(
     local_dir: str,
     rclone_remote: Optional[str] = None,
@@ -183,6 +198,12 @@ def sync_zitpacks(
         gdrive_credentials: Path to a service account JSON key file.
                             The Drive folder must be shared with the account's email.
     """
+    # Strip surrounding shell quotes that leak through $(echo "--flag \"$VAR\"") patterns
+    local_dir = _strip_shell_quotes(local_dir)
+    rclone_remote = _strip_shell_quotes(rclone_remote)
+    gdrive_folder_id = _strip_shell_quotes(gdrive_folder_id)
+    gdrive_credentials = _strip_shell_quotes(gdrive_credentials)
+
     if not rclone_remote and not gdrive_folder_id:
         return  # No sync configured
 
