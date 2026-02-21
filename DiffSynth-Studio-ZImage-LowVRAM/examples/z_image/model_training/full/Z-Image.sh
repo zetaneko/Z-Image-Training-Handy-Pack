@@ -49,6 +49,7 @@ MODEL_PATHS="Tongyi-MAI/Z-Image:transformer/*.safetensors,Tongyi-MAI/Z-Image-Tur
 LEARNING_RATE=1e-5
 NUM_EPOCHS=2
 NUM_WORKERS=8
+SAVE_STEPS=100   # Save a checkpoint every N steps (set to 0 or remove to save per epoch only)
 
 # Output settings
 OUTPUT_PATH="./models/train/Z-Image_full"
@@ -69,6 +70,7 @@ accelerate launch --config_file examples/z_image/model_training/full/accelerate_
   $([ -n "$MODEL_BASE_PATH" ] && echo "--model_base_path \"$MODEL_BASE_PATH\"") \
   --learning_rate $LEARNING_RATE \
   --num_epochs $NUM_EPOCHS \
+  --save_steps $SAVE_STEPS \
   --remove_prefix_in_ckpt "pipe.dit." \
   --output_path "$OUTPUT_PATH" \
   --trainable_models "dit" \
