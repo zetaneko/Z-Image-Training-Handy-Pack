@@ -264,7 +264,7 @@ class DatasetArchive:
         if len(caption_bytes) < entry.caption_size:
             raise CorruptedDataError(f"Truncated caption data at index {idx}")
 
-        return caption_bytes.decode('utf-8')
+        return caption_bytes.decode('utf-8', errors='replace')
 
     def get_entry_info(self, key: Union[int, str]) -> ArchiveEntry:
         """
