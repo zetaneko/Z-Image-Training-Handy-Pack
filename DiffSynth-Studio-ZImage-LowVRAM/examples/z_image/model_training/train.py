@@ -136,20 +136,22 @@ if __name__ == "__main__":
     if str(scripts_dir) not in sys.path:
         sys.path.insert(0, str(scripts_dir))
 
-    # Sync zitpack files from Google Drive if configured (runs before dataset is built)
-    if args.zitpacks and (args.rclone_remote or args.gdrive_folder_id):
-        from gdrive_sync import sync_zitpacks
-        sync_zitpacks(
-            local_dir=args.zitpacks,
-            rclone_remote=args.rclone_remote,
-            gdrive_folder_id=args.gdrive_folder_id,
-            gdrive_credentials=args.gdrive_credentials,
-        )
-
     accelerator = accelerate.Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
     )
+
+    # Sync zitpack files from Google Drive — rank 0 only to avoid concurrent rclone corruption
+    if args.zitpacks and (args.rclone_remote or args.gdrive_folder_id):
+        if accelerator.is_main_process:
+            from gdrive_sync import sync_zitpacks
+            sync_zitpacks(
+                local_dir=args.zitpacks,
+                rclone_remote=args.rclone_remote,
+                gdrive_folder_id=args.gdrive_folder_id,
+                gdrive_credentials=args.gdrive_credentials,
+            )
+        accelerator.wait_for_everyone()  # all ranks wait for rank 0 to finish downloading
 
     if args.zitpacks:
         # Load dataset from .zitpack archives

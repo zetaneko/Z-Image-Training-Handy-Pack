@@ -351,16 +351,18 @@ class CPUOffloadedAdamW:
         if verbose:
             print(f"CPUOffloadedAdamW initialized:")
             print(f"  - LR: {lr}, Betas: {betas}, Weight decay: {weight_decay}")
-            print(f"  - Optimizer state dtype: {self.state_dtype} (always uses float32 internally)")
+            print(f"  - Optimizer state dtype: {self.state_dtype} (compute in float32, store in {self.state_dtype})")
             print(f"  - {len(self.param_names)} parameters tracked")
 
     def _get_or_create_state(self, param_name: str, param_shape: torch.Size, dtype: torch.dtype) -> Dict[str, Any]:
         """Get existing state or create new one for a parameter"""
         if param_name not in self.state:
+            # state_dtype controls storage dtype (float32 = max stability, bfloat16 = half RAM).
+            # Computation always happens in float32 (upcast on load, downcast on store).
             self.state[param_name] = {
                 'step': 0,
-                'exp_avg': torch.zeros(param_shape, dtype=torch.float32, device='cpu'),
-                'exp_avg_sq': torch.zeros(param_shape, dtype=torch.float32, device='cpu'),
+                'exp_avg': torch.zeros(param_shape, dtype=self.state_dtype, device='cpu'),
+                'exp_avg_sq': torch.zeros(param_shape, dtype=self.state_dtype, device='cpu'),
             }
         return self.state[param_name]
 
@@ -414,9 +416,9 @@ class CPUOffloadedAdamW:
             # Apply update
             param.addcdiv_(exp_avg, denom, value=-step_size)
 
-        # Move state back to CPU
-        state['exp_avg'] = exp_avg.cpu()
-        state['exp_avg_sq'] = exp_avg_sq.cpu()
+        # Move state back to CPU in storage dtype (saves RAM vs float32)
+        state['exp_avg'] = exp_avg.to('cpu', dtype=self.state_dtype)
+        state['exp_avg_sq'] = exp_avg_sq.to('cpu', dtype=self.state_dtype)
 
     def zero_grad(self):
         """No-op since gradients are handled externally"""
@@ -820,10 +822,15 @@ class ZImageLayerGroupTrainingModule(DiffusionTrainingModule):
 
         self.accumulated_grads.clear()
 
-    def run_optimizer_step(self, optimizer: CPUOffloadedAdamW):
+    def run_optimizer_step(self, optimizer: CPUOffloadedAdamW, world_size: int = 1, sync_device: str = None):
         """Run optimizer step one layer group at a time to save memory.
 
-        Instead of loading all layers to GPU for optimizer, we:
+        In multi-GPU mode, gradient averaging is done per layer group with an async
+        all_reduce that is launched BEFORE loading that group's weights from CPU RAM.
+        Because NVLink (all_reduce) and PCIe (layer load) are separate buses they can
+        run concurrently, hiding most of the gradient-sync overhead.
+
+Instead of loading all layers to GPU for optimizer, we:
         1. Load one group at a time
         2. Apply gradients to that group using AdamW (with CPU-offloaded states)
         3. Offload the group
@@ -842,9 +849,33 @@ class ZImageLayerGroupTrainingModule(DiffusionTrainingModule):
             self.profiler.log_memory("optimizer_step_start")
 
         num_groups = self.layer_offloader.num_groups
+        do_sync = world_size > 1 and sync_device is not None
+
+        def _sync_keys_async(keys):
+            """Pack a list of grad keys into a flat GPU tensor, launch async all_reduce,
+            return (flat_gpu_tensor, work_handle, numels) for later unpacking."""
+            numels = [self.accumulated_grads[k].numel() for k in keys]
+            flat = torch.cat(
+                [self.accumulated_grads[k].float().view(-1) for k in keys]
+            ).to(sync_device)
+            work = dist.all_reduce(flat, op=dist.ReduceOp.SUM, async_op=True)
+            return flat, work, numels
+
+        def _finish_sync(keys, flat, work, numels):
+            """Wait for all_reduce, divide by world_size, write results back to CPU."""
+            work.wait()
+            flat.div_(world_size)
+            flat_cpu = flat.cpu()
+            offset = 0
+            for k, numel in zip(keys, numels):
+                self.accumulated_grads[k] = (
+                    flat_cpu[offset:offset + numel]
+                    .view(self.accumulated_grads[k].shape)
+                    .to(self.accumulated_grads[k].dtype)
+                )
+                offset += numel
 
         with self.profiler.section("optimizer_step"):
-            # Update each layer group one at a time with progress bar
             opt_pbar = tqdm(
                 range(num_groups + 1),  # +1 for persistent params
                 desc="  Optimizer step",
@@ -855,7 +886,29 @@ class ZImageLayerGroupTrainingModule(DiffusionTrainingModule):
                 opt_pbar.set_postfix({"group": f"{group_idx+1}/{num_groups}"})
 
                 with self.profiler.section(f"opt_group_{group_idx}"):
+                    # Collect grad keys for this group
+                    group_keys = []
+                    for layer_idx, layer in enumerate(self.layer_offloader.groups[group_idx]):
+                        layer_base_idx = group_idx * self.layer_offloader.layers_per_group + layer_idx
+                        for name, param in layer.named_parameters():
+                            if param.requires_grad:
+                                param_key = f"layers.{layer_base_idx}.{name}"
+                                if param_key in self.accumulated_grads:
+                                    group_keys.append(param_key)
+
+                    # Launch async all_reduce for this group's grads BEFORE loading
+                    # the group's layers from CPU RAM.  NVLink (all_reduce) and PCIe
+                    # (layer load) are separate buses so they can run concurrently.
+                    sync_state = None
+                    if do_sync and group_keys:
+                        sync_state = _sync_keys_async(group_keys)
+
+                    # Load group weights from CPU → GPU (overlaps with all_reduce above)
                     self.layer_offloader.load_group(group_idx)
+
+                    # Wait for all_reduce to finish and write averaged grads back
+                    if sync_state is not None:
+                        _finish_sync(group_keys, *sync_state)
 
                     for layer_idx, layer in enumerate(self.layer_offloader.groups[group_idx]):
                         layer_base_idx = group_idx * self.layer_offloader.layers_per_group + layer_idx
@@ -867,14 +920,23 @@ class ZImageLayerGroupTrainingModule(DiffusionTrainingModule):
                                         param.device, dtype=param.dtype
                                     )
                                     optimizer.step_for_param(param_key, param, grad)
-                                    del grad  # Clean up immediately
+                                    del grad
 
                     self.layer_offloader.offload_group(group_idx)
                 opt_pbar.update(1)
 
-            # Also update persistent DIT components (embedders, final layer, refiners)
+            # Persistent DIT components (embedders, final layer, refiners)
             opt_pbar.set_postfix({"group": "persistent"})
             with self.profiler.section("opt_persistent"):
+                # Sync persistent grads (small — do it synchronously for simplicity)
+                if do_sync:
+                    pers_keys = [
+                        k for k in self.accumulated_grads if k.startswith("persistent.")
+                    ]
+                    if pers_keys:
+                        flat, work, numels = _sync_keys_async(pers_keys)
+                        _finish_sync(pers_keys, flat, work, numels)
+
                 self._move_dit_persistent_to_gpu()
                 dit = self.pipe.dit
                 for name, param in dit.named_parameters():
@@ -2298,10 +2360,21 @@ def main():
     if is_main:
         print(f"Dataset size: {len(dataset)} samples")
 
-    # Load model: rank 0 goes first so it can download weights without race conditions.
-    # Other ranks wait at the barrier, then load from the already-populated cache.
-    if rank > 0 and world_size > 1:
-        dist.barrier()
+    # Rank 0 triggers the download (if needed); others wait.
+    # Once files are cached locally all ranks load in parallel — no need to
+    # serialise the actual model initialisation.
+    if world_size > 1:
+        if rank == 0:
+            # Touch / download model files so the cache is populated
+            from diffsynth.core.loader.config import ModelConfig as _MC
+            if args.model_id_with_origin_paths:
+                for spec in args.model_id_with_origin_paths.split(","):
+                    spec = spec.strip()
+                    if not os.path.exists(spec) and ":" in spec:
+                        _mid, _, _pat = spec.rpartition(":")
+                        cfg = _MC(model_id=_mid, origin_file_pattern=_pat)
+                        cfg.download_if_necessary()
+        dist.barrier()  # All ranks wait until rank 0 has finished downloading
 
     model = ZImageLayerGroupTrainingModule(
         model_paths=args.model_paths,
@@ -2318,9 +2391,6 @@ def main():
         verbose=args.verbose and is_main,
         profile=args.profile and is_main,
     )
-
-    if rank == 0 and world_size > 1:
-        dist.barrier()  # Signal other ranks to start loading
 
     # Count trainable parameters
     trainable_params = list(model.trainable_modules())
@@ -2348,7 +2418,8 @@ def main():
                 param_names.append(f"persistent.{name}")
 
     # Parse optimizer state dtype
-    state_dtype = torch.float16 if getattr(args, 'optimizer_state_dtype', 'float32') == "float16" else torch.float32
+    _dtype_map = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
+    state_dtype = _dtype_map.get(getattr(args, 'optimizer_state_dtype', 'float32'), torch.float32)
 
     optimizer = CPUOffloadedAdamW(
         param_groups=[{"param_names": param_names}],
@@ -2515,14 +2586,14 @@ def main():
                 continue
 
             if args.gradient_accumulation_steps == 1 or (batch_idx + 1) % args.gradient_accumulation_steps == 0:
-                # Average gradients across all ranks before the optimizer step.
-                # Each rank computed gradients on its own data shard; averaging them
-                # is equivalent to training on the full (world_size × batch) dataset.
-                if world_size > 1:
-                    sync_grads_across_ranks(model.accumulated_grads, world_size, computation_device)
-
-                # Run optimizer step (loads layer groups one at a time to GPU)
-                model.run_optimizer_step(optimizer)
+                # Gradient averaging across ranks is now done INSIDE run_optimizer_step,
+                # per layer group, with an async all_reduce that overlaps with the
+                # CPU→GPU layer load (NVLink + PCIe run concurrently).
+                model.run_optimizer_step(
+                    optimizer,
+                    world_size=world_size,
+                    sync_device=computation_device if world_size > 1 else None,
+                )
 
                 # Update learning rate
                 lr_scheduler.step()

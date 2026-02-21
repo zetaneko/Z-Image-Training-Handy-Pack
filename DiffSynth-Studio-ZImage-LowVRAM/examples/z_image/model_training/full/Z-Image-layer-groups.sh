@@ -115,7 +115,7 @@ ADAM_BETA1=0.9
 ADAM_BETA2=0.999
 ADAM_EPS=1e-8
 WEIGHT_DECAY=0.01
-OPTIMIZER_STATE_DTYPE="float32"
+OPTIMIZER_STATE_DTYPE="bfloat16"  # bfloat16 halves optimizer RAM vs float32 (critical for multi-GPU)
 
 # LR scheduler settings
 WARMUP_STEPS=10
