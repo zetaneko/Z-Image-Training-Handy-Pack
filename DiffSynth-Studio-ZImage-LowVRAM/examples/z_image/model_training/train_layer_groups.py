@@ -22,6 +22,7 @@ Usage:
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 import os
 import argparse
 import gc
@@ -1773,6 +1774,36 @@ class ZImageLayerGroupTrainingModule(DiffusionTrainingModule):
         return self.pipe.dit.training
 
 
+def sync_grads_across_ranks(accumulated_grads: dict, world_size: int, device: str):
+    """Average gradients across all distributed ranks using a single flat all-reduce.
+
+    Packs all accumulated gradient tensors into one float32 buffer, performs a
+    SUM all-reduce via NCCL, divides by world_size, then unpacks back to CPU.
+    Using a single large all-reduce is significantly faster than one call per param.
+    """
+    if world_size <= 1 or not accumulated_grads:
+        return
+
+    # Deterministic key ordering so all ranks pack/unpack identically
+    keys = sorted(accumulated_grads.keys())
+    shapes = [accumulated_grads[k].shape for k in keys]
+    dtypes = [accumulated_grads[k].dtype for k in keys]
+    numels = [accumulated_grads[k].numel() for k in keys]
+
+    # Pack into a flat float32 tensor on the compute device (required for NCCL)
+    flat = torch.cat([accumulated_grads[k].float().view(-1) for k in keys]).to(device)
+
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+    flat.div_(world_size)
+
+    # Unpack back to CPU in the original dtype
+    flat_cpu = flat.cpu()
+    offset = 0
+    for key, shape, dtype, numel in zip(keys, shapes, dtypes, numels):
+        accumulated_grads[key] = flat_cpu[offset:offset + numel].view(shape).to(dtype)
+        offset += numel
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Z-Image Layer Group Training")
 
@@ -1783,7 +1814,20 @@ def parse_args():
     parser.add_argument("--zitpacks", type=str, default=None,
                         help="Directory containing .zitpack archive files. "
                              "When provided, --dataset_base_path and --dataset_metadata_path are ignored.")
+    parser.add_argument("--zitpack_repeats", type=str, default=None,
+                        help='Per-dataset repeat multipliers. Comma-separated "name:count" pairs. '
+                             'Example: "anime:3,portrait:2" makes anime_*.zitpack appear 3x as often.')
     parser.add_argument("--dataset_repeat", type=int, default=1)
+
+    # Google Drive sync args (optional - downloads missing zitpack files before training)
+    parser.add_argument("--rclone_remote", type=str, default=None,
+                        help="rclone remote path to sync zitpacks from, e.g. 'gdrive:MyFolder/zitpacks'. "
+                             "Requires rclone to be installed and configured.")
+    parser.add_argument("--gdrive_folder_id", type=str, default=None,
+                        help="Google Drive folder ID to download .zitpack files from. "
+                             "Requires --gdrive_credentials (service account JSON).")
+    parser.add_argument("--gdrive_credentials", type=str, default=None,
+                        help="Path to service account credentials JSON for Google Drive access.")
     parser.add_argument("--max_pixels", type=int, default=262144)
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--width", type=int, default=None)
@@ -2112,15 +2156,28 @@ def load_image_from_data(image_data, base_path: str):
 def main():
     args = parse_args()
 
+    # Initialize distributed training.
+    # When launched with torchrun, RANK/WORLD_SIZE/LOCAL_RANK are set automatically.
+    # Falls back to single-GPU when those vars are absent (plain `python` launch).
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if world_size > 1:
+        dist.init_process_group(backend="nccl")
+    computation_device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+    is_main = (rank == 0)
+
     # Validate dataset source: need either --zitpacks or --dataset_base_path
     if not args.zitpacks and not args.dataset_base_path:
-        print("Error: Either --zitpacks or --dataset_base_path must be provided.")
+        if is_main:
+            print("Error: Either --zitpacks or --dataset_base_path must be provided.")
         sys.exit(1)
 
     # Set custom model base path if provided
     if args.model_base_path is not None:
         os.environ['DIFFSYNTH_MODEL_BASE_PATH'] = args.model_base_path
-        print(f"Using custom model base path: {args.model_base_path}")
+        if is_main:
+            print(f"Using custom model base path: {args.model_base_path}")
 
     # Set random seed for reproducibility
     random.seed(args.seed)
@@ -2128,61 +2185,77 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    print("=" * 60)
-    print("Z-Image Layer Group Training")
-    print("=" * 60)
-
-    # Optionally scale LR with effective batch size (disabled by default)
+    # Optionally scale LR with effective batch size (applied on all ranks, printed on rank 0)
     if args.scale_lr_with_batch:
         baseline_batch = 1
         effective_multiplier = args.images_per_group_batch / baseline_batch
         args.learning_rate *= effective_multiplier
-        print(f"Scaled LR to {args.learning_rate} for batch size {args.images_per_group_batch} (multiplier: {effective_multiplier:.1f}x)")
-        # Also scale warmup (sqrt for stability)
-        import math
         args.warmup_steps = int(args.warmup_steps * math.sqrt(effective_multiplier))
-        print(f"Scaled warmup steps to {args.warmup_steps}")
-    print(f"Layer groups: {args.num_layer_groups}")
-    print(f"Images per group batch: {args.images_per_group_batch}")
-    print(f"Gradient accumulation: {args.gradient_accumulation_steps}")
-    print(f"Max pixels: {args.max_pixels}")
-    print(f"FP8 models: {args.fp8_models}")
-    print(f"Learning rate: {args.learning_rate}")
-    print(f"LR scheduler: {args.lr_scheduler} (warmup: {args.warmup_steps} steps)")
-    print(f"AdamW: betas=({args.adam_beta1}, {args.adam_beta2}), eps={args.adam_eps}, wd={args.weight_decay}")
-    print(f"Seed: {args.seed}")
-    print(f"Profiling: {args.profile}")
-    if args.continue_training:
-        print(f"Continue training: will resume from {args.output_path} if checkpoint exists")
-    elif args.resume_from_checkpoint:
-        print(f"Resuming from: {args.resume_from_checkpoint}")
-    print("=" * 60)
+        if is_main:
+            print(f"Scaled LR to {args.learning_rate} for batch size {args.images_per_group_batch} (multiplier: {effective_multiplier:.1f}x)")
+            print(f"Scaled warmup steps to {args.warmup_steps}")
 
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name()}")
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
-    print("=" * 60)
+    if is_main:
+        print("=" * 60)
+        if world_size > 1:
+            print(f"Z-Image Layer Group Training  [{world_size} GPUs, data parallel]")
+        else:
+            print("Z-Image Layer Group Training")
+        print("=" * 60)
+        print(f"Layer groups: {args.num_layer_groups}")
+        print(f"Images per group batch: {args.images_per_group_batch}")
+        print(f"Gradient accumulation: {args.gradient_accumulation_steps}")
+        print(f"Max pixels: {args.max_pixels}")
+        print(f"FP8 models: {args.fp8_models}")
+        print(f"Learning rate: {args.learning_rate}")
+        print(f"LR scheduler: {args.lr_scheduler} (warmup: {args.warmup_steps} steps)")
+        print(f"AdamW: betas=({args.adam_beta1}, {args.adam_beta2}), eps={args.adam_eps}, wd={args.weight_decay}")
+        print(f"Seed: {args.seed}")
+        print(f"Profiling: {args.profile}")
+        if args.continue_training:
+            print(f"Continue training: will resume from {args.output_path} if checkpoint exists")
+        elif args.resume_from_checkpoint:
+            print(f"Resuming from: {args.resume_from_checkpoint}")
+        print("=" * 60)
+        if torch.cuda.is_available():
+            print(f"GPU: {torch.cuda.get_device_name(local_rank)}")
+            print(f"GPU Memory: {torch.cuda.get_device_properties(local_rank).total_memory / 1024**3:.1f}GB")
+        print("=" * 60)
 
-    # Create dataset
+    # Add python-scripts to path for local utilities
+    scripts_dir = Path(__file__).resolve().parent.parent.parent.parent.parent / "python-scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+
+    # Sync zitpack files from Google Drive (rank 0 only, then barrier so others see the files)
+    if is_main and args.zitpacks and (args.rclone_remote or args.gdrive_folder_id):
+        from gdrive_sync import sync_zitpacks
+        sync_zitpacks(
+            local_dir=args.zitpacks,
+            rclone_remote=args.rclone_remote,
+            gdrive_folder_id=args.gdrive_folder_id,
+            gdrive_credentials=getattr(args, "gdrive_credentials", None),
+        )
+    if world_size > 1:
+        dist.barrier()  # All ranks wait for rank 0 to finish downloading
+
+    # Create dataset (each rank reads independently from the same files)
     if args.zitpacks:
-        # Load dataset from .zitpack archives
         zitpack_dir = Path(args.zitpacks)
         zitpack_files = sorted(zitpack_dir.glob("*.zitpack"))
         if not zitpack_files:
-            print(f"Error: No .zitpack files found in {zitpack_dir}")
+            if is_main:
+                print(f"Error: No .zitpack files found in {zitpack_dir}")
             sys.exit(1)
 
-        # Add python-scripts/ to path for dataset_archive import
-        scripts_dir = Path(__file__).resolve().parent.parent.parent.parent.parent / "python-scripts"
-        if str(scripts_dir) not in sys.path:
-            sys.path.insert(0, str(scripts_dir))
         from dataset_archive import ZitpackDataset, parse_zitpack_repeats
 
         archive_repeats = parse_zitpack_repeats(zitpack_files, args.zitpack_repeats)
         dataset = ZitpackDataset(zitpack_files, repeat=args.dataset_repeat, archive_repeats=archive_repeats)
-        print(f"Loaded {dataset.archive_count} zitpack archive(s) with {dataset.total_entries} unique entries ({dataset.weighted_entries} weighted)")
-        for f, r in zip(zitpack_files, archive_repeats):
-            print(f"  - {f.name}  (repeat x{r})")
+        if is_main:
+            print(f"Loaded {dataset.archive_count} zitpack archive(s) with {dataset.total_entries} unique entries ({dataset.weighted_entries} weighted)")
+            for f, r in zip(zitpack_files, archive_repeats):
+                print(f"  - {f.name}  (repeat x{r})")
     else:
         dataset = UnifiedDataset(
             base_path=args.dataset_base_path,
@@ -2198,9 +2271,14 @@ def main():
             )
         )
 
-    print(f"Dataset size: {len(dataset)} samples")
+    if is_main:
+        print(f"Dataset size: {len(dataset)} samples")
 
-    # Create training module
+    # Load model: rank 0 goes first so it can download weights without race conditions.
+    # Other ranks wait at the barrier, then load from the already-populated cache.
+    if rank > 0 and world_size > 1:
+        dist.barrier()
+
     model = ZImageLayerGroupTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
@@ -2209,28 +2287,34 @@ def main():
         use_gradient_checkpointing=args.use_gradient_checkpointing,
         use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
         fp8_models=args.fp8_models,
-        computation_device="cuda",
+        computation_device=computation_device,
         num_layer_groups=args.num_layer_groups,
         images_per_group_batch=args.images_per_group_batch,
         max_pixels=args.max_pixels,
-        verbose=args.verbose,
-        profile=args.profile,
+        verbose=args.verbose and is_main,
+        profile=args.profile and is_main,
     )
+
+    if rank == 0 and world_size > 1:
+        dist.barrier()  # Signal other ranks to start loading
 
     # Count trainable parameters
     trainable_params = list(model.trainable_modules())
     num_trainable = sum(p.numel() for p in trainable_params)
-    print(f"Trainable parameters: {num_trainable:,}")
+    if is_main:
+        print(f"Trainable parameters: {num_trainable:,}")
 
-    # Calculate total training steps for scheduler
-    steps_per_epoch = len(dataset) // args.images_per_group_batch
+    # Calculate total training steps for scheduler.
+    # Each rank processes a shard of the dataset, so steps_per_epoch is per-rank.
+    per_rank_dataset_size = len(dataset) // world_size
+    steps_per_epoch = per_rank_dataset_size // args.images_per_group_batch
     total_training_steps = steps_per_epoch * args.num_epochs
 
-    print(f"Steps per epoch: {steps_per_epoch}")
-    print(f"Total training steps: {total_training_steps}")
+    if is_main:
+        print(f"Steps per epoch: {steps_per_epoch} (per rank; {world_size} rank(s) process {world_size * steps_per_epoch * args.images_per_group_batch} images/epoch total)")
+        print(f"Total training steps: {total_training_steps}")
 
     # Create CPU-offloaded AdamW optimizer
-    # Collect parameter names for tracking
     param_names = []
     for name, param in model.pipe.dit.named_parameters():
         if param.requires_grad:
@@ -2248,7 +2332,7 @@ def main():
         betas=(args.adam_beta1, args.adam_beta2),
         eps=args.adam_eps,
         weight_decay=args.weight_decay,
-        verbose=args.verbose,
+        verbose=args.verbose and is_main,
         state_dtype=state_dtype,
     )
 
@@ -2261,27 +2345,27 @@ def main():
         scheduler_type=args.lr_scheduler,
     )
 
-    print(f"Optimizer: CPUOffloadedAdamW (states on CPU RAM)")
-    print(f"LR Scheduler: {args.lr_scheduler} with {args.warmup_steps} warmup steps")
+    if is_main:
+        print(f"Optimizer: CPUOffloadedAdamW (states on CPU RAM)")
+        print(f"LR Scheduler: {args.lr_scheduler} with {args.warmup_steps} warmup steps")
 
     # Resume from checkpoint if specified
     start_epoch = 0
     global_step = 0
 
-    # Determine checkpoint path: --continue_training uses output_path, --resume_from_checkpoint uses explicit path
     checkpoint_path = None
     if args.continue_training:
-        checkpoint_path = args.output_path  # Directory path - load_training_state handles this
+        checkpoint_path = args.output_path
     elif args.resume_from_checkpoint:
         checkpoint_path = args.resume_from_checkpoint
 
     if checkpoint_path:
-        # Check if checkpoint exists before trying to load
         if os.path.isdir(checkpoint_path):
             state_file = os.path.join(checkpoint_path, "training_state_latest.pt")
             if not os.path.exists(state_file):
                 if args.continue_training:
-                    print(f"No checkpoint found in {checkpoint_path}, starting fresh training")
+                    if is_main:
+                        print(f"No checkpoint found in {checkpoint_path}, starting fresh training")
                     checkpoint_path = None
                 else:
                     raise FileNotFoundError(f"No training_state_latest.pt found in {checkpoint_path}")
@@ -2294,18 +2378,15 @@ def main():
             )
 
             # Allow overriding the learning rate on resume
-            # When resuming, the checkpoint restores the old base_lr. If the user
-            # specified a different --learning_rate, apply it as the new base_lr
-            # so the scheduler uses it going forward.
             checkpoint_base_lr = lr_scheduler.base_lr
             requested_lr = args.learning_rate
             if abs(requested_lr - checkpoint_base_lr) > 1e-12:
                 lr_scheduler.base_lr = requested_lr
-                # Recalculate and apply the LR for the current step with the new base
                 current_lr = lr_scheduler._get_lr()
                 optimizer.set_lr(current_lr)
-                print(f"Learning rate override: base_lr changed from {checkpoint_base_lr:.2e} to {requested_lr:.2e}")
-                print(f"  Effective LR at step {lr_scheduler.current_step}: {current_lr:.2e}")
+                if is_main:
+                    print(f"Learning rate override: base_lr changed from {checkpoint_base_lr:.2e} to {requested_lr:.2e}")
+                    print(f"  Effective LR at step {lr_scheduler.current_step}: {current_lr:.2e}")
 
     # Create model logger
     model_logger = ModelLogger(
@@ -2316,33 +2397,35 @@ def main():
     # Ensure output directory exists
     os.makedirs(args.output_path, exist_ok=True)
 
-    # Training loop
-    print("\n" + "=" * 60)
-    print("Starting training...")
-    print("=" * 60)
-
-    # Calculate swap efficiency
-    naive_swaps = args.images_per_group_batch * args.num_layer_groups * 2  # forward + backward
-    optimized_swaps = args.num_layer_groups * 2  # forward + backward
-    print(f"Swap reduction: {naive_swaps} -> {optimized_swaps} per batch ({naive_swaps / optimized_swaps:.1f}x improvement)")
-    print("=" * 60)
+    if is_main:
+        print("\n" + "=" * 60)
+        print("Starting training...")
+        print("=" * 60)
+        naive_swaps = args.images_per_group_batch * args.num_layer_groups * 2
+        optimized_swaps = args.num_layer_groups * 2
+        print(f"Swap reduction: {naive_swaps} -> {optimized_swaps} per batch ({naive_swaps / optimized_swaps:.1f}x improvement)")
+        print("=" * 60)
 
     model.pipe.dit.train()
 
     for epoch in range(start_epoch, args.num_epochs):
-        print(f"\nEpoch {epoch + 1}/{args.num_epochs}")
+        if is_main:
+            print(f"\nEpoch {epoch + 1}/{args.num_epochs}")
 
-        # Shuffle dataset indices
+        # Use a deterministic per-epoch shuffle so all ranks see the same ordering,
+        # then each rank takes a contiguous slice.
         indices = list(range(len(dataset)))
-        random.shuffle(indices)
+        epoch_rng = random.Random(args.seed + epoch)
+        epoch_rng.shuffle(indices)
 
-        # Process in batches of images_per_group_batch
+        per_rank = len(indices) // world_size
+        indices = indices[rank * per_rank : (rank + 1) * per_rank]
+
         num_batches = len(indices) // args.images_per_group_batch
 
-        progress_bar = tqdm(range(num_batches), desc=f"Epoch {epoch+1}")
+        progress_bar = tqdm(range(num_batches), desc=f"Epoch {epoch+1}", disable=not is_main)
 
         for batch_idx in progress_bar:
-            # Collect batch of images
             start_idx = batch_idx * args.images_per_group_batch
             end_idx = start_idx + args.images_per_group_batch
             batch_indices = indices[start_idx:end_idx]
@@ -2360,32 +2443,69 @@ def main():
                     prompt = sample["prompt"][0] if isinstance(sample["prompt"], list) else sample["prompt"]
                     batch.append({"image": image, "prompt": prompt})
                 except Exception as e:
-                    print(f"Warning: Failed to load image at index {idx}: {e}")
+                    if is_main:
+                        print(f"Warning: Failed to load image at index {idx}: {e}")
                     skip_batch = True
                     break
 
-            if skip_batch or len(batch) == 0:
+            # Coordinate skip across ranks: if any rank needs to skip, all skip.
+            # This prevents all_reduce deadlocks from mismatched batch counts.
+            if world_size > 1:
+                skip_tensor = torch.tensor(
+                    [1.0 if (skip_batch or len(batch) == 0) else 0.0],
+                    device=computation_device,
+                )
+                dist.all_reduce(skip_tensor, op=dist.ReduceOp.MAX)
+                if skip_tensor.item() > 0:
+                    continue
+            elif skip_batch or len(batch) == 0:
                 continue
 
+            # OOM-safe processing with cross-rank coordination.
+            # If any rank hits OOM mid-batch, we need all ranks to skip together
+            # (otherwise the grad-sync all_reduce would deadlock).
+            batch_loss = 0.0
+            oom_flag = torch.zeros(1, device=computation_device)
             try:
-                # Process batch with optimized layer-group swapping
-                # This does forward and backward for all images with minimal swaps
                 loss_scale = 1.0 / args.gradient_accumulation_steps
                 batch_loss = model.process_image_batch(batch, loss_scale=loss_scale)
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    oom_flag[0] = 1.0
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    model.accumulated_grads.clear()
+                else:
+                    raise e
 
-                # Optimizer step after each batch (or after accumulation if gradient_accumulation_steps > 1)
-                # For simplicity, we step after each batch here since batching already provides
-                # effective gradient accumulation
-                if args.gradient_accumulation_steps == 1 or (batch_idx + 1) % args.gradient_accumulation_steps == 0:
-                    # Run optimizer step (loads groups one at a time)
-                    model.run_optimizer_step(optimizer)
+            if world_size > 1:
+                dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX)
 
-                    # Update learning rate
-                    lr_scheduler.step()
+            if oom_flag.item() > 0:
+                if is_main:
+                    print(f"\nOOM at batch {batch_idx}! Clearing cache and continuing...")
+                    print(f"Consider reducing --images_per_group_batch (currently {args.images_per_group_batch})")
+                torch.cuda.empty_cache()
+                gc.collect()
+                model.accumulated_grads.clear()
+                continue
 
-                    global_step += 1
+            if args.gradient_accumulation_steps == 1 or (batch_idx + 1) % args.gradient_accumulation_steps == 0:
+                # Average gradients across all ranks before the optimizer step.
+                # Each rank computed gradients on its own data shard; averaging them
+                # is equivalent to training on the full (world_size × batch) dataset.
+                if world_size > 1:
+                    sync_grads_across_ranks(model.accumulated_grads, world_size, computation_device)
 
-                    # Logging
+                # Run optimizer step (loads layer groups one at a time to GPU)
+                model.run_optimizer_step(optimizer)
+
+                # Update learning rate
+                lr_scheduler.step()
+
+                global_step += 1
+
+                if is_main:
                     current_lr = lr_scheduler.get_lr()
                     progress_bar.set_postfix({
                         "loss": f"{batch_loss:.4f}",
@@ -2393,12 +2513,12 @@ def main():
                         "step": global_step
                     })
 
-                    # Print profiler report at intervals
                     if args.profile and global_step % args.profile_report_interval == 0:
                         model.profiler.report()
                         model.profiler.reset()
 
-                    # Save checkpoint
+                    # Save checkpoint (rank 0 only — optimizer states are identical
+                    # across ranks after grad sync, so one copy is sufficient)
                     if global_step % args.save_steps == 0:
                         print(f"\nSaving checkpoint at step {global_step}...")
                         save_training_state(
@@ -2410,35 +2530,26 @@ def main():
                             lr_scheduler,
                         )
 
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    print(f"\nOOM at batch {batch_idx}! Clearing cache and continuing...")
-                    print(f"Consider reducing --images_per_group_batch (currently {args.images_per_group_batch})")
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                    model.accumulated_grads.clear()
-                    continue
-                else:
-                    raise e
+    if is_main:
+        print("\nTraining complete!")
 
-    print("\nTraining complete!")
+        if args.profile:
+            print("\nFinal profiler report:")
+            model.profiler.report()
 
-    # Final profiler report
-    if args.profile:
-        print("\nFinal profiler report:")
-        model.profiler.report()
+        print("Saving final checkpoint...")
+        save_training_state(
+            args.output_path,
+            global_step,
+            args.num_epochs,
+            model,
+            optimizer,
+            lr_scheduler,
+        )
+        print(f"Saved to {args.output_path}")
 
-    # Final save
-    print("Saving final checkpoint...")
-    save_training_state(
-        args.output_path,
-        global_step,
-        args.num_epochs,
-        model,
-        optimizer,
-        lr_scheduler,
-    )
-    print(f"Saved to {args.output_path}")
+    if world_size > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

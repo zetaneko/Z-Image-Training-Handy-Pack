@@ -10,6 +10,15 @@ def add_dataset_base_config(parser: argparse.ArgumentParser):
                              'Comma-separated "name:count" pairs where "name" matches the prefix of zitpack filenames. '
                              'Example: "anime:3,portrait:2" makes anime_*.zitpack files appear 3x as often as portrait_*.zitpack files. '
                              'Files without a match use repeat=1.')
+    parser.add_argument("--rclone_remote", type=str, default=None,
+                        help="rclone remote path to sync .zitpack files from before training, "
+                             "e.g. 'gdrive:MyFolder/zitpacks'. Requires rclone to be installed and configured.")
+    parser.add_argument("--gdrive_folder_id", type=str, default=None,
+                        help="Google Drive folder ID to download .zitpack files from. "
+                             "Requires --gdrive_credentials (service account JSON).")
+    parser.add_argument("--gdrive_credentials", type=str, default=None,
+                        help="Path to a service account credentials JSON for Google Drive access. "
+                             "The Drive folder must be shared with the service account's email.")
     parser.add_argument("--dataset_repeat", type=int, default=1, help="Number of times to repeat the dataset per epoch.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
     parser.add_argument("--data_file_keys", type=str, default="image,video", help="Data file keys in the metadata. Comma-separated.")

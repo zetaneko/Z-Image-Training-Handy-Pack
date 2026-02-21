@@ -113,6 +113,21 @@ if __name__ == "__main__":
         print("Error: Either --zitpacks or --dataset_base_path must be provided.")
         sys.exit(1)
 
+    # Add python-scripts to path for local utilities
+    scripts_dir = Path(__file__).resolve().parent.parent.parent.parent.parent / "python-scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+
+    # Sync zitpack files from Google Drive if configured (runs before dataset is built)
+    if args.zitpacks and (args.rclone_remote or args.gdrive_folder_id):
+        from gdrive_sync import sync_zitpacks
+        sync_zitpacks(
+            local_dir=args.zitpacks,
+            rclone_remote=args.rclone_remote,
+            gdrive_folder_id=args.gdrive_folder_id,
+            gdrive_credentials=args.gdrive_credentials,
+        )
+
     accelerator = accelerate.Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
@@ -126,9 +141,6 @@ if __name__ == "__main__":
             print(f"Error: No .zitpack files found in {zitpack_dir}")
             sys.exit(1)
 
-        scripts_dir = Path(__file__).resolve().parent.parent.parent.parent.parent / "python-scripts"
-        if str(scripts_dir) not in sys.path:
-            sys.path.insert(0, str(scripts_dir))
         from dataset_archive import ZitpackDataset, parse_zitpack_repeats
 
         _resizer = ImageCropAndResize(
