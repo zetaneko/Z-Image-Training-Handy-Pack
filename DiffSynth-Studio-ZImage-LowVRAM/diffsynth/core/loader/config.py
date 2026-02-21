@@ -78,7 +78,7 @@ class ModelConfig:
             if os.environ.get('DIFFSYNTH_DOWNLOAD_SOURCE') is not None:
                 return os.environ.get('DIFFSYNTH_DOWNLOAD_SOURCE')
             else:
-                return "modelscope"
+                return "huggingface"
         else:
             return self.download_source
         
