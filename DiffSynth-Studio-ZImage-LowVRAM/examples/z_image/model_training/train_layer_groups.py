@@ -2176,12 +2176,13 @@ def main():
         scripts_dir = Path(__file__).resolve().parent.parent.parent.parent.parent / "python-scripts"
         if str(scripts_dir) not in sys.path:
             sys.path.insert(0, str(scripts_dir))
-        from dataset_archive import ZitpackDataset
+        from dataset_archive import ZitpackDataset, parse_zitpack_repeats
 
-        dataset = ZitpackDataset(zitpack_files, repeat=args.dataset_repeat)
-        print(f"Loaded {dataset.archive_count} zitpack archive(s) with {dataset.total_entries} entries")
-        for f in zitpack_files:
-            print(f"  - {f}")
+        archive_repeats = parse_zitpack_repeats(zitpack_files, args.zitpack_repeats)
+        dataset = ZitpackDataset(zitpack_files, repeat=args.dataset_repeat, archive_repeats=archive_repeats)
+        print(f"Loaded {dataset.archive_count} zitpack archive(s) with {dataset.total_entries} unique entries ({dataset.weighted_entries} weighted)")
+        for f, r in zip(zitpack_files, archive_repeats):
+            print(f"  - {f.name}  (repeat x{r})")
     else:
         dataset = UnifiedDataset(
             base_path=args.dataset_base_path,

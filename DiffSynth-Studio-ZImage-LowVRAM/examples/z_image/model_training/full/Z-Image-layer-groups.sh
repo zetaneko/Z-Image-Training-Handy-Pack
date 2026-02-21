@@ -65,6 +65,10 @@ DATASET_METADATA="${DATASET_PATH}/metadata.csv"
 # Set ZITPACK_DIR to a directory containing .zitpack files to use instead of DATASET_PATH.
 # Create zitpacks with: python3 python-scripts/pack_dataset.py --input <folder> --output <dir>
 # ZITPACK_DIR="/path/to/zitpacks"
+# Per-dataset repeat multipliers (optional, only used with ZITPACK_DIR).
+# Files matching the prefix get sampled that many times more per epoch.
+# Example: anime_chunk_001.zitpack gets 3x, portrait_chunk_001.zitpack gets 2x.
+# ZITPACK_REPEATS="anime:3,portrait:2"
 DATASET_REPEAT=25
 MAX_PIXELS=1048576
 
@@ -118,6 +122,7 @@ CONTINUE_TRAINING=false
 
 python examples/z_image/model_training/train_layer_groups.py \
   $([ -n "$ZITPACK_DIR" ] && echo "--zitpacks \"$ZITPACK_DIR\"" || echo "--dataset_base_path \"$DATASET_PATH\" --dataset_metadata_path \"$DATASET_METADATA\"") \
+  $([ -n "$ZITPACK_REPEATS" ] && echo "--zitpack_repeats \"$ZITPACK_REPEATS\"") \
   --dataset_repeat $DATASET_REPEAT \
   --max_pixels $MAX_PIXELS \
   --model_id_with_origin_paths "$MODEL_PATHS" \

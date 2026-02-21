@@ -1,5 +1,7 @@
-import torch, os, argparse, accelerate, copy
+import torch, os, sys, argparse, accelerate, copy
+from pathlib import Path
 from diffsynth.core import UnifiedDataset
+from diffsynth.core.data.operators import ImageCropAndResize
 from diffsynth.pipelines.z_image import ZImagePipeline, ModelConfig
 from diffsynth.diffusion import *
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -106,24 +108,68 @@ if __name__ == "__main__":
         os.environ['DIFFSYNTH_MODEL_BASE_PATH'] = args.model_base_path
         print(f"Using custom model base path: {args.model_base_path}")
 
+    # Validate dataset source
+    if not args.zitpacks and not args.dataset_base_path:
+        print("Error: Either --zitpacks or --dataset_base_path must be provided.")
+        sys.exit(1)
+
     accelerator = accelerate.Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
     )
-    dataset = UnifiedDataset(
-        base_path=args.dataset_base_path,
-        metadata_path=args.dataset_metadata_path,
-        repeat=args.dataset_repeat,
-        data_file_keys=args.data_file_keys.split(","),
-        main_data_operator=UnifiedDataset.default_image_operator(
-            base_path=args.dataset_base_path,
+
+    if args.zitpacks:
+        # Load dataset from .zitpack archives
+        zitpack_dir = Path(args.zitpacks)
+        zitpack_files = sorted(zitpack_dir.glob("*.zitpack"))
+        if not zitpack_files:
+            print(f"Error: No .zitpack files found in {zitpack_dir}")
+            sys.exit(1)
+
+        scripts_dir = Path(__file__).resolve().parent.parent.parent.parent.parent / "python-scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        from dataset_archive import ZitpackDataset, parse_zitpack_repeats
+
+        _resizer = ImageCropAndResize(
             max_pixels=args.max_pixels,
-            height=args.height,
-            width=args.width,
             height_division_factor=16,
             width_division_factor=16,
         )
-    )
+        archive_repeats = parse_zitpack_repeats(zitpack_files, args.zitpack_repeats)
+        _base_dataset = ZitpackDataset(zitpack_files, repeat=args.dataset_repeat, archive_repeats=archive_repeats)
+
+        class _ResizedZitpackDataset:
+            load_from_cache = False
+            def __init__(self, ds, resizer):
+                self._ds = ds
+                self._resizer = resizer
+            def __len__(self):
+                return len(self._ds)
+            def __getitem__(self, i):
+                d = self._ds[i]
+                d["image"] = self._resizer(d["image"])
+                return d
+
+        dataset = _ResizedZitpackDataset(_base_dataset, _resizer)
+        print(f"Loaded {_base_dataset.archive_count} zitpack archive(s) with {_base_dataset.total_entries} unique entries ({_base_dataset.weighted_entries} weighted)")
+        for f, r in zip(zitpack_files, archive_repeats):
+            print(f"  - {f.name}  (repeat x{r})")
+    else:
+        dataset = UnifiedDataset(
+            base_path=args.dataset_base_path,
+            metadata_path=args.dataset_metadata_path,
+            repeat=args.dataset_repeat,
+            data_file_keys=args.data_file_keys.split(","),
+            main_data_operator=UnifiedDataset.default_image_operator(
+                base_path=args.dataset_base_path,
+                max_pixels=args.max_pixels,
+                height=args.height,
+                width=args.width,
+                height_division_factor=16,
+                width_division_factor=16,
+            )
+        )
     model = ZImageTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,

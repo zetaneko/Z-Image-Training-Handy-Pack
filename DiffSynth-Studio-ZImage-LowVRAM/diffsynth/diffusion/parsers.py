@@ -2,8 +2,14 @@ import argparse
 
 
 def add_dataset_base_config(parser: argparse.ArgumentParser):
-    parser.add_argument("--dataset_base_path", type=str, default="", required=True, help="Base path of the dataset.")
+    parser.add_argument("--dataset_base_path", type=str, default=None, help="Base path of the dataset (required unless --zitpacks is used).")
     parser.add_argument("--dataset_metadata_path", type=str, default=None, help="Path to the metadata file of the dataset.")
+    parser.add_argument("--zitpacks", type=str, default=None, help="Directory containing .zitpack archive files. When provided, --dataset_base_path and --dataset_metadata_path are ignored.")
+    parser.add_argument("--zitpack_repeats", type=str, default=None,
+                        help='Per-dataset repeat multipliers for zitpack archives. '
+                             'Comma-separated "name:count" pairs where "name" matches the prefix of zitpack filenames. '
+                             'Example: "anime:3,portrait:2" makes anime_*.zitpack files appear 3x as often as portrait_*.zitpack files. '
+                             'Files without a match use repeat=1.')
     parser.add_argument("--dataset_repeat", type=int, default=1, help="Number of times to repeat the dataset per epoch.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
     parser.add_argument("--data_file_keys", type=str, default="image,video", help="Data file keys in the metadata. Comma-separated.")
