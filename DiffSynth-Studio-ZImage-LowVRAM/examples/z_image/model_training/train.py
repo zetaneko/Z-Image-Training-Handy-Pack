@@ -202,6 +202,24 @@ if __name__ == "__main__":
                 width_division_factor=16,
             )
         )
+    # Pre-download models on rank 0 only — prevents concurrent HF downloads from
+    # corrupting partial files and causing hash-detection failures on other ranks.
+    if accelerator.num_processes > 1:
+        if accelerator.is_main_process:
+            from diffsynth.core.loader.config import ModelConfig as _MC
+            if args.model_id_with_origin_paths:
+                for spec in args.model_id_with_origin_paths.split(","):
+                    spec = spec.strip()
+                    if not os.path.exists(spec) and ":" in spec:
+                        _mid, _, _pat = spec.rpartition(":")
+                        cfg = _MC(model_id=_mid, origin_file_pattern=_pat)
+                        cfg.download_if_necessary()
+            # Also pre-download the tokenizer (small but same race applies)
+            if args.tokenizer_path is None:
+                cfg = _MC(model_id="Tongyi-MAI/Z-Image-Turbo", origin_file_pattern="tokenizer/")
+                cfg.download_if_necessary()
+        accelerator.wait_for_everyone()  # all ranks wait for rank 0 to finish downloading
+
     model = ZImageTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
