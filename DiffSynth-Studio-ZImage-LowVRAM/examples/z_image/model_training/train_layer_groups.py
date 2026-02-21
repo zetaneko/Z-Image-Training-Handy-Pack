@@ -2156,6 +2156,26 @@ def load_image_from_data(image_data, base_path: str):
 def main():
     args = parse_args()
 
+    # Strip any literal shell quotes that leak through $(echo "--flag \"$VAR\"") patterns.
+    # Bash does NOT strip quote characters from command substitution output, so paths and
+    # values passed via $(echo "... \"$VAR\"") arrive as '"value"' with actual " chars.
+    def _sq(s):
+        if s is None:
+            return None
+        s = s.strip()
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+            s = s[1:-1]
+        return s
+
+    args.zitpacks = _sq(args.zitpacks)
+    args.zitpack_repeats = _sq(args.zitpack_repeats)
+    args.dataset_base_path = _sq(args.dataset_base_path)
+    args.dataset_metadata_path = _sq(args.dataset_metadata_path)
+    args.model_base_path = _sq(args.model_base_path)
+    args.rclone_remote = _sq(args.rclone_remote)
+    args.gdrive_folder_id = _sq(args.gdrive_folder_id)
+    args.gdrive_credentials = _sq(args.gdrive_credentials)
+
     # Initialize distributed training.
     # When launched with torchrun, RANK/WORLD_SIZE/LOCAL_RANK are set automatically.
     # Falls back to single-GPU when those vars are absent (plain `python` launch).

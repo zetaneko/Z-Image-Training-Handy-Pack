@@ -103,6 +103,24 @@ if __name__ == "__main__":
     parser = z_image_parser()
     args = parser.parse_args()
 
+    # Strip literal shell quotes that leak through $(echo "--flag \"$VAR\"") patterns
+    def _sq(s):
+        if s is None:
+            return None
+        s = s.strip()
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+            s = s[1:-1]
+        return s
+
+    args.zitpacks = _sq(args.zitpacks)
+    args.zitpack_repeats = _sq(args.zitpack_repeats)
+    args.dataset_base_path = _sq(args.dataset_base_path)
+    args.dataset_metadata_path = _sq(args.dataset_metadata_path)
+    args.model_base_path = _sq(args.model_base_path)
+    args.rclone_remote = _sq(args.rclone_remote)
+    args.gdrive_folder_id = _sq(args.gdrive_folder_id)
+    args.gdrive_credentials = _sq(args.gdrive_credentials)
+
     # Set custom model base path if provided
     if args.model_base_path is not None:
         os.environ['DIFFSYNTH_MODEL_BASE_PATH'] = args.model_base_path
