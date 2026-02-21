@@ -2292,6 +2292,20 @@ def main():
                 lr_scheduler,
             )
 
+            # Allow overriding the learning rate on resume
+            # When resuming, the checkpoint restores the old base_lr. If the user
+            # specified a different --learning_rate, apply it as the new base_lr
+            # so the scheduler uses it going forward.
+            checkpoint_base_lr = lr_scheduler.base_lr
+            requested_lr = args.learning_rate
+            if abs(requested_lr - checkpoint_base_lr) > 1e-12:
+                lr_scheduler.base_lr = requested_lr
+                # Recalculate and apply the LR for the current step with the new base
+                current_lr = lr_scheduler._get_lr()
+                optimizer.set_lr(current_lr)
+                print(f"Learning rate override: base_lr changed from {checkpoint_base_lr:.2e} to {requested_lr:.2e}")
+                print(f"  Effective LR at step {lr_scheduler.current_step}: {current_lr:.2e}")
+
     # Create model logger
     model_logger = ModelLogger(
         args.output_path,

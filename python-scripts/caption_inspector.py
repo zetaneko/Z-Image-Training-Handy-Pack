@@ -205,7 +205,8 @@ class CaptionInspectorTab(ttk.Frame):
 
         ttk.Button(action_frame, text="Select All", command=self._select_all).pack(side='left', padx=(0, 5))
         ttk.Button(action_frame, text="Deselect All", command=self._deselect_all).pack(side='left', padx=(0, 5))
-        ttk.Button(action_frame, text="Delete Selected", command=self._delete_selected).pack(side='left', padx=(0, 10))
+        ttk.Button(action_frame, text="Delete Selected", command=self._delete_selected).pack(side='left', padx=(0, 5))
+        ttk.Button(action_frame, text="Copy / Move...", command=self._export_selected).pack(side='left', padx=(0, 10))
         self.selection_var = tk.StringVar(value="")
         ttk.Label(action_frame, textvariable=self.selection_var).pack(side='right')
 
@@ -284,6 +285,8 @@ class CaptionInspectorTab(ttk.Frame):
         self.context_menu = tk.Menu(self.tree, tearoff=0)
         self.context_menu.add_command(label="Copy Caption", command=self._copy_caption)
         self.context_menu.add_command(label="Open File Location", command=self._open_file_location)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Copy / Move to...", command=self._export_selected)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Delete", command=self._delete_selected)
         self.tree.bind('<Button-3>', self._show_context_menu)
@@ -978,6 +981,179 @@ class CaptionInspectorTab(ttk.Frame):
 
         if errors:
             messagebox.showwarning("Delete Warning", f"Deleted, but {errors} file(s) could not be removed.")
+
+    # ── Copy / Move Export ─────────────────────────────────────────
+
+    def _show_export_dialog(self, disk_count: int, archive_skip: int):
+        """Show dialog to choose destination and operation. Returns (dest_dir, 'copy'|'move') or None."""
+        from tkinter import filedialog
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Copy / Move Selected Images")
+        dialog.resizable(False, False)
+        dialog.transient(self.winfo_toplevel())
+        dialog.grab_set()
+
+        result = [None]
+
+        msg = f"{disk_count:,} image(s) selected"
+        if archive_skip:
+            msg += f"  ({archive_skip} archive item(s) will be skipped)"
+        ttk.Label(dialog, text=msg, padding=(10, 10, 10, 0)).pack(anchor='w')
+
+        # Operation choice
+        op_frame = ttk.LabelFrame(dialog, text="Operation", padding=10)
+        op_frame.pack(fill='x', padx=10, pady=(8, 5))
+        op_var = tk.StringVar(value="copy")
+        ttk.Radiobutton(op_frame, text="Copy  (keep originals in place)",
+                        variable=op_var, value="copy").pack(anchor='w')
+        ttk.Radiobutton(op_frame, text="Move  (remove originals after copying)",
+                        variable=op_var, value="move").pack(anchor='w')
+
+        # Destination folder
+        dest_frame = ttk.LabelFrame(dialog, text="Destination Folder", padding=10)
+        dest_frame.pack(fill='x', padx=10, pady=(0, 10))
+        dest_var = tk.StringVar()
+        dest_entry = ttk.Entry(dest_frame, textvariable=dest_var, width=45)
+        dest_entry.pack(side='left', fill='x', expand=True, padx=(0, 5))
+
+        def browse_dest():
+            path = filedialog.askdirectory(title="Select Destination Folder")
+            if path:
+                dest_var.set(path)
+
+        ttk.Button(dest_frame, text="Browse...", command=browse_dest).pack(side='left')
+
+        # OK / Cancel
+        btn_frame = ttk.Frame(dialog, padding=(10, 0, 10, 10))
+        btn_frame.pack(fill='x')
+
+        def on_ok():
+            dest = dest_var.get().strip()
+            if not dest:
+                messagebox.showwarning("No Destination",
+                                       "Please select a destination folder.", parent=dialog)
+                return
+            result[0] = (dest, op_var.get())
+            dialog.destroy()
+
+        def on_cancel():
+            dialog.destroy()
+
+        ttk.Button(btn_frame, text="OK", command=on_ok, width=10).pack(side='right', padx=(5, 0))
+        ttk.Button(btn_frame, text="Cancel", command=on_cancel, width=10).pack(side='right')
+
+        # Center over parent window
+        dialog.update_idletasks()
+        px = self.winfo_rootx() + (self.winfo_width() - dialog.winfo_width()) // 2
+        py = self.winfo_rooty() + (self.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{px}+{py}")
+
+        self.wait_window(dialog)
+        return result[0]
+
+    def _export_selected(self):
+        """Copy or move selected images and their caption files to a destination directory."""
+        import shutil
+
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showinfo("Nothing Selected", "Please select images to copy/move.")
+            return
+
+        disk_ids = [iid for iid in selection
+                    if iid in self.entries and self.entries[iid].caption_type != 'archive']
+        archive_count = len(selection) - len(disk_ids)
+
+        if not disk_ids:
+            messagebox.showinfo("Archive Only",
+                                "Selected items are all from packed archives and cannot be moved/copied.\n"
+                                "Archive entries are read-only.")
+            return
+
+        result = self._show_export_dialog(len(disk_ids), archive_count)
+        if result is None:
+            return
+
+        dest_dir, operation = result
+        dest_path = Path(dest_dir)
+
+        try:
+            dest_path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("Error", f"Cannot create destination directory:\n{e}")
+            return
+
+        errors = 0
+        success_count = 0
+        moved_ids = []
+
+        for iid in disk_ids:
+            entry = self.entries[iid]
+            img = entry.image_path
+            dest_img = dest_path / img.name
+
+            # Skip if source and destination are the same file
+            try:
+                same = dest_img.resolve() == img.resolve()
+            except Exception:
+                same = False
+            if same:
+                errors += 1
+                continue
+
+            try:
+                if operation == 'move':
+                    shutil.move(str(img), str(dest_img))
+                else:
+                    shutil.copy2(str(img), str(dest_img))
+
+                # Also handle caption/sidecar files
+                for suffix in ['.txt', '.autocaption.txt', '.quality.txt']:
+                    cap_file = img.with_suffix(suffix)
+                    if cap_file.exists():
+                        dest_cap = dest_path / cap_file.name
+                        try:
+                            same_cap = dest_cap.resolve() == cap_file.resolve()
+                        except Exception:
+                            same_cap = False
+                        if not same_cap:
+                            if operation == 'move':
+                                shutil.move(str(cap_file), str(dest_cap))
+                            else:
+                                shutil.copy2(str(cap_file), str(dest_cap))
+
+                success_count += 1
+                if operation == 'move':
+                    moved_ids.append(iid)
+
+            except Exception:
+                errors += 1
+
+        # Remove moved items from the list
+        if moved_ids:
+            for iid in moved_ids:
+                try:
+                    self.tree.delete(iid)
+                except Exception:
+                    pass
+                self.entries.pop(iid, None)
+                if iid in self.all_item_ids:
+                    self.all_item_ids.remove(iid)
+                self.detached_ids.discard(iid)
+
+            self._clear_preview()
+            visible = len(self.all_item_ids) - len(self.detached_ids)
+            self.status_var.set(f"Showing {visible:,} of {len(self.all_item_ids):,} images")
+            self._update_selection_count()
+
+        op_word = "moved" if operation == 'move' else "copied"
+        msg = f"{success_count:,} image(s) {op_word} to:\n{dest_dir}"
+        if archive_count:
+            msg += f"\n\n{archive_count} archive item(s) were skipped (read-only)."
+        if errors:
+            msg += f"\n{errors} item(s) could not be {op_word} (name conflict or I/O error)."
+        messagebox.showinfo("Export Complete", msg)
 
     # ── Sorting ────────────────────────────────────────────────────
 
