@@ -124,13 +124,21 @@ class ZitpackDataset:
         Returns:
             Dict with "image" (PIL.Image in RGB) and "prompt" (str).
         """
-        real_idx = data_id % len(self._global_index)
-        archive_idx, entry_idx = self._global_index[real_idx]
-
-        image_bytes, caption = self._archives[archive_idx][entry_idx]
-        image = Image.open(BytesIO(image_bytes)).convert("RGB")
-
-        return {"image": image, "prompt": caption}
+        n = len(self._global_index)
+        for offset in range(n):
+            real_idx = (data_id + offset) % n
+            archive_idx, entry_idx = self._global_index[real_idx]
+            try:
+                image_bytes, caption = self._archives[archive_idx][entry_idx]
+                image = Image.open(BytesIO(image_bytes)).convert("RGB")
+                if offset > 0:
+                    print(f"Warning: skipped {offset} corrupt entry(s) starting at dataset index {data_id % n}; "
+                          f"using archive {archive_idx}, entry {entry_idx} instead.")
+                return {"image": image, "prompt": caption}
+            except Exception as e:
+                print(f"Warning: skipping corrupt entry (archive={archive_idx}, entry={entry_idx}): {e}")
+                continue
+        raise RuntimeError("No valid images found in dataset after exhausting all entries.")
 
     def __len__(self) -> int:
         return len(self._global_index) * self.repeat
