@@ -91,6 +91,22 @@ MAX_PIXELS=1048576
 MODEL_PATHS="Tongyi-MAI/Z-Image:transformer/*.safetensors,Tongyi-MAI/Z-Image:text_encoder/*.safetensors,Tongyi-MAI/Z-Image:vae/diffusion_pytorch_model.safetensors"
 # MODEL_BASE_PATH=""  # Uncomment and set to override default ./models location (e.g., "/data/models" or "$HOME/.cache/huggingface")
 
+# Pre-fine-tuned transformer checkpoint (optional)
+# Use this to start training from a previously fine-tuned DIT instead of the base HuggingFace weights.
+# The VAE and text encoder still come from MODEL_PATHS above.
+# This is useful for continuing a fine-tune after a dataset update or hyperparameter change
+# without needing a full training state (optimizer, scheduler) from --resume_from_checkpoint.
+#
+# Local file:
+#   PRETRAINED_TRANSFORMER="/path/to/model_step_5000.safetensors"
+#
+# Google Drive via rclone (recommended — configure once with 'rclone config'):
+#   PRETRAINED_TRANSFORMER="gdrive:checkpoints/model_step_5000.safetensors"
+#   PRETRAINED_TRANSFORMER="myremote:Training/Z-Image/model_step_5000.safetensors"
+#
+# The file will be downloaded to $OUTPUT_PATH/pretrained_cache/ and reused on subsequent runs.
+# PRETRAINED_TRANSFORMER=""
+
 # Multi-GPU settings
 # NUM_GPUS defaults to the number of CUDA GPUs on this machine.
 # Set explicitly to use fewer GPUs, e.g. NUM_GPUS=1 for single-GPU mode.
@@ -152,6 +168,7 @@ torchrun --nproc_per_node=$NUM_GPUS examples/z_image/model_training/train_layer_
   --max_pixels $MAX_PIXELS \
   --model_id_with_origin_paths "$MODEL_PATHS" \
   $([ -n "$MODEL_BASE_PATH" ] && echo "--model_base_path \"$MODEL_BASE_PATH\"") \
+  $([ -n "$PRETRAINED_TRANSFORMER" ] && echo "--pretrained_transformer \"$PRETRAINED_TRANSFORMER\"") \
   --trainable_models "dit" \
   --num_layer_groups $NUM_LAYER_GROUPS \
   --images_per_group_batch $IMAGES_PER_GROUP_BATCH \

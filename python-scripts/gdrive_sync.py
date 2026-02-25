@@ -175,6 +175,51 @@ def _strip_shell_quotes(s: Optional[str]) -> Optional[str]:
     return s
 
 
+def download_file_from_remote(remote_path: str, local_dir: Path) -> Path:
+    """
+    Download a single file from an rclone remote to a local directory.
+
+    Skips the download if the file already exists locally.
+
+    Args:
+        remote_path: Full rclone path to the file, e.g.
+                     "gdrive:checkpoints/model_step_5000.safetensors".
+        local_dir:   Local directory to download the file into (created if absent).
+
+    Returns:
+        Path to the local copy of the file.
+    """
+    if not shutil.which("rclone"):
+        raise RuntimeError(
+            "rclone is not installed or not in PATH.\n"
+            "Install from https://rclone.org/install/ then configure with: rclone config"
+        )
+
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = remote_path.rsplit("/", 1)[-1]
+    local_file = local_dir / filename
+
+    if local_file.exists():
+        print(f"Checkpoint already cached locally: {local_file}")
+        return local_file
+
+    print(f"Downloading checkpoint: {remote_path} → {local_file}")
+    subprocess.run(
+        ["rclone", "copy", remote_path, str(local_dir), "--progress"],
+        check=True,
+    )
+
+    if not local_file.exists():
+        raise FileNotFoundError(
+            f"rclone reported success but file not found at: {local_file}\n"
+            f"Check that the remote path is correct: {remote_path}"
+        )
+
+    print(f"Downloaded: {local_file}")
+    return local_file
+
+
 def sync_zitpacks(
     local_dir: str,
     rclone_remote: Optional[str] = None,

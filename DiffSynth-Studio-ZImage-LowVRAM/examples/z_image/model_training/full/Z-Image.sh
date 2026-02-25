@@ -38,6 +38,23 @@ DATASET_METADATA="${DATASET_PATH}/metadata.csv"
 #   the Drive folder with the service account's email (shown in the JSON as "client_email").
 # GDRIVE_FOLDER_ID="1AbCdEfGhIjKlMnOpQrStUvWxYz"
 # GDRIVE_CREDENTIALS="/path/to/service-account.json"
+
+# Pre-fine-tuned transformer checkpoint (optional)
+# Load a previously fine-tuned model_step_N.safetensors as the DIT starting weights
+# instead of the base HuggingFace model. VAE and text encoder still come from the base model.
+# Useful for continuing a fine-tune from a fixed/exported checkpoint without needing a full
+# training state (optimizer, scheduler) from --resume_from_checkpoint.
+#
+# Local file:
+#   PRETRAINED_TRANSFORMER="/path/to/model_step_5000.safetensors"
+#
+# Google Drive via rclone (recommended — configure once with 'rclone config'):
+#   PRETRAINED_TRANSFORMER="gdrive:checkpoints/model_step_5000.safetensors"
+#   PRETRAINED_TRANSFORMER="myremote:Training/Z-Image/model_step_5000.safetensors"
+#
+# The file will be downloaded to $OUTPUT_PATH/pretrained_cache/ and reused on subsequent runs.
+# PRETRAINED_TRANSFORMER=""
+
 DATASET_REPEAT=400
 MAX_PIXELS=1048576
 
@@ -64,6 +81,7 @@ accelerate launch --config_file examples/z_image/model_training/full/accelerate_
   $([ -n "$RCLONE_REMOTE" ] && echo "--rclone_remote \"$RCLONE_REMOTE\"") \
   $([ -n "$GDRIVE_FOLDER_ID" ] && echo "--gdrive_folder_id \"$GDRIVE_FOLDER_ID\"") \
   $([ -n "$GDRIVE_CREDENTIALS" ] && echo "--gdrive_credentials \"$GDRIVE_CREDENTIALS\"") \
+  $([ -n "$PRETRAINED_TRANSFORMER" ] && echo "--pretrained_transformer \"$PRETRAINED_TRANSFORMER\"") \
   --max_pixels $MAX_PIXELS \
   --dataset_repeat $DATASET_REPEAT \
   --model_id_with_origin_paths "$MODEL_PATHS" \

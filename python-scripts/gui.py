@@ -514,55 +514,118 @@ class FixDiffSynthTab(ttk.Frame):
         self.settings_manager = settings_manager
         self.tab_name = 'fix_diffsynth'
 
-        # Description
-        desc = ttk.Label(self, text="Convert DiffSynth-Studio checkpoints to standard format for ComfyUI.\n"
-                                    "Fuses attention keys and merges with base model weights.",
-                        wraplength=600, justify='left')
-        desc.pack(anchor='w', pady=(0, 15))
+        # Mode toggle
+        self.reverse_mode = tk.BooleanVar(value=False)
+        mode_frame = ttk.Frame(self)
+        mode_frame.pack(anchor='w', pady=(0, 10))
+        ttk.Radiobutton(mode_frame, text="Fix for ComfyUI  (DiffSynth \u2192 standard)",
+                        variable=self.reverse_mode, value=False,
+                        command=self._on_mode_change).pack(side='left', padx=(0, 20))
+        ttk.Radiobutton(mode_frame, text="Restore for DiffSynth  (standard \u2192 DiffSynth)",
+                        variable=self.reverse_mode, value=True,
+                        command=self._on_mode_change).pack(side='left')
 
-        # Original model
-        self.original_path = PathSelector(self, "Original Base Model:", mode='open')
+        # Description (updated on mode change)
+        self.desc_label = ttk.Label(self, wraplength=600, justify='left')
+        self.desc_label.pack(anchor='w', pady=(0, 15))
+
+        # Original model row (hidden in reverse mode) — wrapped in a frame for easy show/hide
+        self.original_frame = ttk.Frame(self)
+        self.original_path = PathSelector(self.original_frame, "Original Base Model:", mode='open')
         self.original_path.pack(fill='x', pady=5)
-        ttk.Label(self, text="(e.g., zImageBase_base.safetensors)").pack(anchor='e', padx=(0, 80))
+        ttk.Label(self.original_frame, text="(e.g., zImageBase_base.safetensors)").pack(anchor='e', padx=(0, 80))
+        self.original_frame.pack(fill='x')
 
         # Input checkpoint
-        self.input_path = PathSelector(self, "Fine-tuned Checkpoint:", mode='open')
+        self.input_path = PathSelector(self, "Input Checkpoint:", mode='open')
         self.input_path.pack(fill='x', pady=5)
-        ttk.Label(self, text="(e.g., step-2000.safetensors)").pack(anchor='e', padx=(0, 80))
+        self.input_hint = ttk.Label(self, text="")
+        self.input_hint.pack(anchor='e', padx=(0, 80))
 
         # Output file
         self.output_path = PathSelector(self, "Output File:", mode='save')
         self.output_path.pack(fill='x', pady=5)
-        ttk.Label(self, text="(e.g., step-2000-fixed.safetensors)").pack(anchor='e', padx=(0, 80))
+        self.output_hint = ttk.Label(self, text="")
+        self.output_hint.pack(anchor='e', padx=(0, 80))
+
+        # Validate options
+        validate_outer = ttk.Frame(self)
+        validate_outer.pack(fill='x', pady=(10, 0))
+        self.validate_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(validate_outer, text="Validate output after conversion",
+                        variable=self.validate_var,
+                        command=self._on_validate_change).pack(anchor='w')
+
+        # Reference path (shown only when validate is checked)
+        self.reference_frame = ttk.Frame(self)
+        self.reference_path = PathSelector(self.reference_frame, "Reference Checkpoint:", mode='open')
+        self.reference_path.pack(fill='x', pady=5)
+        ttk.Label(self.reference_frame,
+                  text="(optional) Compare keys/shapes/dtypes against this checkpoint").pack(anchor='e', padx=(0, 80))
 
         # Run button
         self.run_btn = ttk.Button(self, text="Run", command=self._run)
         self.run_btn.pack(pady=15)
 
         self.runner = ScriptRunner(output_widget, self.run_btn)
+        self._on_mode_change()
+
+    def _on_mode_change(self):
+        if self.reverse_mode.get():
+            self.desc_label.config(
+                text="Restore a fixed checkpoint back to DiffSynth training format.\n"
+                     "Unfuses attention keys (qkv \u2192 to_q/to_k/to_v) so the model can be loaded for continued training.")
+            self.original_frame.pack_forget()
+            self.input_hint.config(text="(fixed checkpoint, e.g., step-2000-fixed.safetensors)")
+            self.output_hint.config(text="(e.g., step-2000-restored.safetensors)")
+        else:
+            self.desc_label.config(
+                text="Convert DiffSynth-Studio checkpoints to standard format for ComfyUI.\n"
+                     "Fuses attention keys (to_q/to_k/to_v \u2192 qkv) and merges with base model weights.")
+            self.original_frame.pack(fill='x', before=self.input_path)
+            self.input_hint.config(text="(fine-tuned DiffSynth checkpoint, e.g., step-2000.safetensors)")
+            self.output_hint.config(text="(e.g., step-2000-fixed.safetensors)")
+
+    def _on_validate_change(self):
+        if self.validate_var.get():
+            self.reference_frame.pack(fill='x', before=self.run_btn)
+        else:
+            self.reference_frame.pack_forget()
 
     def _run(self):
-        original_path = self.original_path.get()
         input_path = self.input_path.get()
         output_path = self.output_path.get()
 
-        if not original_path:
-            self.runner.clear_output()
-            self.runner.append_output("Error: Please select the original base model\n")
-            return
         if not input_path:
             self.runner.clear_output()
-            self.runner.append_output("Error: Please select the fine-tuned checkpoint\n")
+            self.runner.append_output("Error: Please select the input checkpoint\n")
             return
         if not output_path:
             self.runner.clear_output()
             self.runner.append_output("Error: Please specify an output file\n")
             return
 
-        cmd = [sys.executable, str(self.script_path),
-               '--original', original_path,
-               '--input', input_path,
-               '--output', output_path]
+        if self.reverse_mode.get():
+            cmd = [sys.executable, str(self.script_path),
+                   '--reverse',
+                   '--input', input_path,
+                   '--output', output_path]
+        else:
+            original_path = self.original_path.get()
+            if not original_path:
+                self.runner.clear_output()
+                self.runner.append_output("Error: Please select the original base model\n")
+                return
+            cmd = [sys.executable, str(self.script_path),
+                   '--original', original_path,
+                   '--input', input_path,
+                   '--output', output_path]
+
+        if self.validate_var.get():
+            cmd.append('--validate')
+            ref = self.reference_path.get()
+            if ref:
+                cmd += ['--reference', ref]
 
         self.runner.run(cmd)
 

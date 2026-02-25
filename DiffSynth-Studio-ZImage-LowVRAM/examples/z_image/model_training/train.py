@@ -96,6 +96,11 @@ def z_image_parser():
     parser = add_general_config(parser)
     parser = add_image_size_config(parser)
     parser.add_argument("--tokenizer_path", type=str, default=None, help="Path to tokenizer.")
+    parser.add_argument("--pretrained_transformer", type=str, default=None,
+                        help="Path to a pre-fine-tuned transformer .safetensors to use as DIT starting "
+                             "weights instead of the base HuggingFace weights. Accepts a local path or "
+                             "an rclone remote path (e.g. 'gdrive:checkpoints/model_step_5000.safetensors'). "
+                             "VAE and text encoder still come from the base model.")
     return parser
 
 
@@ -120,6 +125,7 @@ if __name__ == "__main__":
     args.rclone_remote = _sq(args.rclone_remote)
     args.gdrive_folder_id = _sq(args.gdrive_folder_id)
     args.gdrive_credentials = _sq(args.gdrive_credentials)
+    args.pretrained_transformer = _sq(args.pretrained_transformer)
 
     # Set custom model base path if provided
     if args.model_base_path is not None:
@@ -239,6 +245,47 @@ if __name__ == "__main__":
         task=args.task,
         device=accelerator.device,
     )
+
+    # Optionally override the DIT weights with a pre-fine-tuned transformer checkpoint.
+    # This lets you start a new training run from a previously saved model_step_N.safetensors
+    # instead of the base HuggingFace weights, without needing a full training state resume.
+    if args.pretrained_transformer:
+        pretrained_path = args.pretrained_transformer
+
+        # Detect rclone remote paths: "remote:path/file" (colon after >1 chars, not a Windows drive).
+        is_remote = (
+            not os.path.isfile(pretrained_path)
+            and ":" in pretrained_path
+            and pretrained_path.index(":") > 1
+        )
+
+        if is_remote:
+            cache_dir = Path(args.output_path) / "pretrained_cache"
+            filename = pretrained_path.rsplit("/", 1)[-1]
+            local_file = cache_dir / filename
+            if accelerator.is_main_process:
+                print(f"\nDownloading pre-fine-tuned transformer: {pretrained_path}")
+                from gdrive_sync import download_file_from_remote
+                download_file_from_remote(pretrained_path, cache_dir)
+            accelerator.wait_for_everyone()
+            pretrained_path = str(local_file)
+
+        if accelerator.is_main_process:
+            print(f"\nLoading pre-fine-tuned transformer weights: {pretrained_path}")
+        from safetensors.torch import load_file as _load_file
+        import gc
+        state_dict = _load_file(pretrained_path, device="cpu")
+        missing, unexpected = model.pipe.dit.load_state_dict(state_dict, strict=False)
+        num_loaded = len(state_dict) - len(unexpected)
+        del state_dict
+        gc.collect()
+        if accelerator.is_main_process:
+            print(f"  Loaded {num_loaded} parameter tensors into DIT")
+            if missing:
+                print(f"  Missing keys (base weights kept): {len(missing)}")
+            if unexpected:
+                print(f"  Unexpected keys (ignored): {len(unexpected)}")
+
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,

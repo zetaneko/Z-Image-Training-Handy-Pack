@@ -985,7 +985,8 @@ class CaptionInspectorTab(ttk.Frame):
     # ── Copy / Move Export ─────────────────────────────────────────
 
     def _show_export_dialog(self, disk_count: int, archive_skip: int):
-        """Show dialog to choose destination and operation. Returns (dest_dir, 'copy'|'move') or None."""
+        """Show dialog to choose destination and operation.
+        Returns (dest_dir, 'copy'|'move', rename_as_guids: bool) or None."""
         from tkinter import filedialog
 
         dialog = tk.Toplevel(self)
@@ -1009,6 +1010,16 @@ class CaptionInspectorTab(ttk.Frame):
                         variable=op_var, value="copy").pack(anchor='w')
         ttk.Radiobutton(op_frame, text="Move  (remove originals after copying)",
                         variable=op_var, value="move").pack(anchor='w')
+
+        # Options
+        opt_frame = ttk.LabelFrame(dialog, text="Options", padding=10)
+        opt_frame.pack(fill='x', padx=10, pady=(0, 5))
+        rename_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            opt_frame,
+            text="Rename files as random GUIDs  (avoids name conflicts, merges captions to a single .txt)",
+            variable=rename_var,
+        ).pack(anchor='w')
 
         # Destination folder
         dest_frame = ttk.LabelFrame(dialog, text="Destination Folder", padding=10)
@@ -1034,7 +1045,7 @@ class CaptionInspectorTab(ttk.Frame):
                 messagebox.showwarning("No Destination",
                                        "Please select a destination folder.", parent=dialog)
                 return
-            result[0] = (dest, op_var.get())
+            result[0] = (dest, op_var.get(), rename_var.get())
             dialog.destroy()
 
         def on_cancel():
@@ -1055,6 +1066,7 @@ class CaptionInspectorTab(ttk.Frame):
     def _export_selected(self):
         """Copy or move selected images and their caption files to a destination directory."""
         import shutil
+        import uuid
 
         selection = self.tree.selection()
         if not selection:
@@ -1075,7 +1087,7 @@ class CaptionInspectorTab(ttk.Frame):
         if result is None:
             return
 
-        dest_dir, operation = result
+        dest_dir, operation, rename_as_guids = result
         dest_path = Path(dest_dir)
 
         try:
@@ -1091,7 +1103,14 @@ class CaptionInspectorTab(ttk.Frame):
         for iid in disk_ids:
             entry = self.entries[iid]
             img = entry.image_path
-            dest_img = dest_path / img.name
+
+            if rename_as_guids:
+                guid = str(uuid.uuid4())
+                dest_img = dest_path / f"{guid}{img.suffix.lower()}"
+                dest_txt = dest_path / f"{guid}.txt"
+            else:
+                dest_img = dest_path / img.name
+                dest_txt = None
 
             # Skip if source and destination are the same file
             try:
@@ -1108,20 +1127,35 @@ class CaptionInspectorTab(ttk.Frame):
                 else:
                     shutil.copy2(str(img), str(dest_img))
 
-                # Also handle caption/sidecar files
-                for suffix in ['.txt', '.autocaption.txt', '.quality.txt']:
-                    cap_file = img.with_suffix(suffix)
-                    if cap_file.exists():
-                        dest_cap = dest_path / cap_file.name
-                        try:
-                            same_cap = dest_cap.resolve() == cap_file.resolve()
-                        except Exception:
-                            same_cap = False
-                        if not same_cap:
-                            if operation == 'move':
-                                shutil.move(str(cap_file), str(dest_cap))
-                            else:
-                                shutil.copy2(str(cap_file), str(dest_cap))
+                if rename_as_guids:
+                    # Write merged caption as a single <guid>.txt
+                    caption = entry.caption_text or ''
+                    dest_txt.write_text(caption, encoding='utf-8')
+
+                    # Remove originals' sidecar files on move
+                    if operation == 'move':
+                        for suffix in ['.txt', '.autocaption.txt', '.quality.txt']:
+                            cap_file = img.with_suffix(suffix)
+                            if cap_file.exists():
+                                try:
+                                    cap_file.unlink()
+                                except Exception:
+                                    pass
+                else:
+                    # Also handle caption/sidecar files
+                    for suffix in ['.txt', '.autocaption.txt', '.quality.txt']:
+                        cap_file = img.with_suffix(suffix)
+                        if cap_file.exists():
+                            dest_cap = dest_path / cap_file.name
+                            try:
+                                same_cap = dest_cap.resolve() == cap_file.resolve()
+                            except Exception:
+                                same_cap = False
+                            if not same_cap:
+                                if operation == 'move':
+                                    shutil.move(str(cap_file), str(dest_cap))
+                                else:
+                                    shutil.copy2(str(cap_file), str(dest_cap))
 
                 success_count += 1
                 if operation == 'move':
@@ -1149,6 +1183,8 @@ class CaptionInspectorTab(ttk.Frame):
 
         op_word = "moved" if operation == 'move' else "copied"
         msg = f"{success_count:,} image(s) {op_word} to:\n{dest_dir}"
+        if rename_as_guids:
+            msg += "\nFiles renamed as GUIDs with merged .txt captions."
         if archive_count:
             msg += f"\n\n{archive_count} archive item(s) were skipped (read-only)."
         if errors:

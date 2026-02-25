@@ -1903,6 +1903,12 @@ def parse_args():
     parser.add_argument("--tokenizer_path", type=str, default=None)
     parser.add_argument("--trainable_models", type=str, default="dit")
     parser.add_argument("--fp8_models", type=str, default="text_encoder,vae")
+    parser.add_argument("--pretrained_transformer", type=str, default=None,
+                        help="Path to a pre-fine-tuned transformer .safetensors file to use as the DIT "
+                             "starting weights instead of the base HuggingFace weights. Accepts a local "
+                             "path or an rclone remote path (e.g. 'gdrive:checkpoints/model_step_5000.safetensors'). "
+                             "VAE and text encoder still come from the base model. Useful for resuming a "
+                             "fine-tune from a previously saved model_step_N.safetensors checkpoint.")
 
     # Layer group args
     parser.add_argument("--num_layer_groups", type=int, default=6,
@@ -2237,6 +2243,7 @@ def main():
     args.rclone_remote = _sq(args.rclone_remote)
     args.gdrive_folder_id = _sq(args.gdrive_folder_id)
     args.gdrive_credentials = _sq(args.gdrive_credentials)
+    args.pretrained_transformer = _sq(args.pretrained_transformer)
 
     # Initialize distributed training.
     # When launched with torchrun, RANK/WORLD_SIZE/LOCAL_RANK are set automatically.
@@ -2391,6 +2398,46 @@ def main():
         verbose=args.verbose and is_main,
         profile=args.profile and is_main,
     )
+
+    # Optionally override the DIT weights with a pre-fine-tuned transformer checkpoint.
+    # This lets you start a new training run from a previously saved model_step_N.safetensors
+    # instead of the base HuggingFace weights, without needing a full training state resume.
+    if args.pretrained_transformer:
+        pretrained_path = args.pretrained_transformer
+
+        # Detect rclone remote paths: "remote:path/file" (colon after >1 chars, not a Windows drive).
+        is_remote = (
+            not os.path.isfile(pretrained_path)
+            and ":" in pretrained_path
+            and pretrained_path.index(":") > 1
+        )
+
+        if is_remote:
+            # Rank 0 downloads; other ranks wait.
+            cache_dir = Path(args.output_path) / "pretrained_cache"
+            filename = pretrained_path.rsplit("/", 1)[-1]
+            local_file = cache_dir / filename
+            if is_main:
+                print(f"\nDownloading pre-fine-tuned transformer: {pretrained_path}")
+                from gdrive_sync import download_file_from_remote
+                download_file_from_remote(pretrained_path, cache_dir)
+            if world_size > 1:
+                dist.barrier()
+            pretrained_path = str(local_file)
+
+        if is_main:
+            print(f"\nLoading pre-fine-tuned transformer weights: {pretrained_path}")
+        state_dict = load_file(pretrained_path, device="cpu")
+        missing, unexpected = model.pipe.dit.load_state_dict(state_dict, strict=False)
+        num_loaded = len(state_dict) - len(unexpected)
+        del state_dict
+        gc.collect()
+        if is_main:
+            print(f"  Loaded {num_loaded} parameter tensors into DIT")
+            if missing:
+                print(f"  Missing keys (base weights kept): {len(missing)}")
+            if unexpected:
+                print(f"  Unexpected keys (ignored): {len(unexpected)}")
 
     # Count trainable parameters
     trainable_params = list(model.trainable_modules())
